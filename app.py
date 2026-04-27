@@ -2,7 +2,6 @@ import json
 import logging
 import os
 import urllib.error
-import urllib.parse
 import urllib.request
 from datetime import datetime, timezone
 
@@ -12,7 +11,7 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-INSTAGRAM_MEDIA_URL = "https://graph.instagram.com/v24.0/17841476354816630/media"
+INSTAGRAM_SEND_MESSAGE_URL = "https://graph.facebook.com/v24.0/me/messages"
 
 
 def classify_meta_event(payload):
@@ -37,7 +36,37 @@ def classify_meta_event(payload):
     return "unknown"
 
 
-def fetch_instagram_media():
+def extract_dm_sender_id(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    entries = payload.get("entry")
+    if not isinstance(entries, list) or not entries:
+        return None
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        messaging_items = entry.get("messaging")
+        if not isinstance(messaging_items, list):
+            continue
+
+        for item in messaging_items:
+            if not isinstance(item, dict):
+                continue
+
+            sender = item.get("sender")
+            message = item.get("message")
+            if isinstance(sender, dict) and isinstance(message, dict):
+                sender_id = sender.get("id")
+                if sender_id:
+                    return sender_id
+
+    return None
+
+
+def send_instagram_dm(recipient_id, text):
     access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
 
     if not access_token:
@@ -46,11 +75,22 @@ def fetch_instagram_media():
             "error": "INSTAGRAM_ACCESS_TOKEN is not set",
         }
 
-    query = urllib.parse.urlencode({"access_token": access_token})
-    request_url = f"{INSTAGRAM_MEDIA_URL}?{query}"
+    body = json.dumps(
+        {
+            "recipient": {"id": recipient_id},
+            "message": {"text": text},
+            "access_token": access_token,
+        }
+    ).encode("utf-8")
+    api_request = urllib.request.Request(
+        INSTAGRAM_SEND_MESSAGE_URL,
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
 
     try:
-        with urllib.request.urlopen(request_url, timeout=10) as response:
+        with urllib.request.urlopen(api_request, timeout=10) as response:
             body = response.read().decode("utf-8")
             parsed_body = json.loads(body)
             return {
@@ -107,7 +147,17 @@ def webhook():
     payload = request.get_json(silent=True)
     body_text = request.get_data(as_text=True)
     event_type = classify_meta_event(payload)
-    instagram_response = fetch_instagram_media()
+    send_message_response = None
+
+    if event_type == "dm-related":
+        sender_id = extract_dm_sender_id(payload)
+        if sender_id:
+            send_message_response = send_instagram_dm(sender_id, "Testing !")
+        else:
+            send_message_response = {
+                "success": False,
+                "error": "Could not extract sender id from dm-related payload",
+            }
 
     log_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -118,7 +168,7 @@ def webhook():
         "query_params": request.args.to_dict(flat=False),
         "json": payload,
         "raw_body": body_text,
-        "instagram_media_response": instagram_response,
+        "send_message_response": send_message_response,
     }
 
     logger.info("Webhook received:\n%s", json.dumps(log_entry, indent=2, default=str))

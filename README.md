@@ -8,10 +8,12 @@ This is a minimal Flask app for receiving Meta webhook requests on Render. It su
 - `GET /webhook` handles Meta webhook verification.
 - `POST /webhook` prints the incoming request to the Render logs and returns a fast `200 OK`.
 
+For `dm-related` webhook events, the app also sends a reply of `Testing !` back to the message sender.
+
 ## Environment variables
 
 - `META_VERIFY_TOKEN` is the verify token you will also enter in the Meta developer dashboard.
-- `INSTAGRAM_ACCESS_TOKEN` is the access token used for the test `GET https://graph.instagram.com/v24.0/17841476354816630/media` request.
+- `INSTAGRAM_ACCESS_TOKEN` is the access token used to send Instagram DM replies through the Meta Graph API.
 - `PORT` is provided by Render automatically.
 
 ## Run locally
@@ -59,4 +61,4 @@ Open your service in Render and check the **Logs** tab to see:
 - verification attempts
 - detected event type (`comment-related`, `dm-related`, or `unknown`)
 - full webhook payloads
-- the Instagram Graph API test response for each webhook event
+- the send-message API response for `dm-related` events
