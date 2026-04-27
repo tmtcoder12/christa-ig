@@ -1,6 +1,9 @@
 import json
 import logging
 import os
+import urllib.error
+import urllib.parse
+import urllib.request
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
@@ -9,6 +12,8 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+INSTAGRAM_MEDIA_URL = "https://graph.instagram.com/v24.0/17841476354816630/media"
+
 
 def classify_meta_event(payload):
     if not isinstance(payload, dict):
@@ -30,6 +35,48 @@ def classify_meta_event(payload):
             return "dm-related"
 
     return "unknown"
+
+
+def fetch_instagram_media():
+    access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+
+    if not access_token:
+        return {
+            "success": False,
+            "error": "INSTAGRAM_ACCESS_TOKEN is not set",
+        }
+
+    query = urllib.parse.urlencode({"access_token": access_token})
+    request_url = f"{INSTAGRAM_MEDIA_URL}?{query}"
+
+    try:
+        with urllib.request.urlopen(request_url, timeout=10) as response:
+            body = response.read().decode("utf-8")
+            parsed_body = json.loads(body)
+            return {
+                "success": True,
+                "status_code": response.status,
+                "data": parsed_body,
+            }
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "success": False,
+            "status_code": exc.code,
+            "error": error_body,
+        }
+    except urllib.error.URLError as exc:
+        return {
+            "success": False,
+            "error": str(exc.reason),
+        }
+    except json.JSONDecodeError as exc:
+        return {
+            "success": False,
+            "error": f"Invalid JSON response: {exc}",
+        }
+
+
 @app.get("/")
 def healthcheck():
     return jsonify({"status": "ok"})
@@ -53,11 +100,14 @@ def verify_webhook():
         bool(expected_token),
     )
     return "Forbidden", 403
+
+
 @app.post("/webhook")
 def webhook():
     payload = request.get_json(silent=True)
     body_text = request.get_data(as_text=True)
     event_type = classify_meta_event(payload)
+    instagram_response = fetch_instagram_media()
 
     log_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -68,6 +118,7 @@ def webhook():
         "query_params": request.args.to_dict(flat=False),
         "json": payload,
         "raw_body": body_text,
+        "instagram_media_response": instagram_response,
     }
 
     logger.info("Webhook received:\n%s", json.dumps(log_entry, indent=2, default=str))
