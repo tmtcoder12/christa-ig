@@ -11,7 +11,7 @@ from flask import Flask, jsonify, request
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
-INSTAGRAM_SEND_MESSAGE_URL = "https://graph.facebook.com/v24.0/me/messages"
+INSTAGRAM_SEND_MESSAGE_URL = "https://graph.instagram.com/v24.0/me/messages"
 
 
 def classify_meta_event(payload):
@@ -79,13 +79,15 @@ def send_instagram_dm(recipient_id, text):
         {
             "recipient": {"id": recipient_id},
             "message": {"text": text},
-            "access_token": access_token,
         }
     ).encode("utf-8")
     api_request = urllib.request.Request(
         INSTAGRAM_SEND_MESSAGE_URL,
         data=body,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json",
+        },
         method="POST",
     )
 
