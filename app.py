@@ -66,6 +66,45 @@ def extract_dm_sender_id(payload):
     return None
 
 
+def extract_inbound_dm_sender_id(payload):
+    if not isinstance(payload, dict):
+        return None
+
+    entries = payload.get("entry")
+    if not isinstance(entries, list) or not entries:
+        return None
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        account_id = entry.get("id")
+        messaging_items = entry.get("messaging")
+        if not isinstance(messaging_items, list):
+            continue
+
+        for item in messaging_items:
+            if not isinstance(item, dict):
+                continue
+
+            sender = item.get("sender")
+            message = item.get("message")
+            if not isinstance(sender, dict) or not isinstance(message, dict):
+                continue
+
+            sender_id = sender.get("id")
+            message_text = message.get("text")
+            if not sender_id or not message_text:
+                continue
+
+            if sender_id == account_id:
+                continue
+
+            return sender_id
+
+    return None
+
+
 def send_instagram_dm(recipient_id, text):
     access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
 
@@ -152,13 +191,13 @@ def webhook():
     send_message_response = None
 
     if event_type == "dm-related":
-        sender_id = extract_dm_sender_id(payload)
+        sender_id = extract_inbound_dm_sender_id(payload)
         if sender_id:
             send_message_response = send_instagram_dm(sender_id, "Testing !")
         else:
             send_message_response = {
                 "success": False,
-                "error": "Could not extract sender id from dm-related payload",
+                "error": "No inbound dm sender found in dm-related payload",
             }
 
     log_entry = {
