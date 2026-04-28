@@ -1,19 +1,23 @@
 # Python Meta Webhook for Render
 
-This is a minimal Flask app for receiving Meta webhook requests on Render. It supports webhook verification and prints incoming event payloads to the console.
+This is a Flask app for receiving Meta webhook requests on Render. It supports webhook verification, replies to inbound Instagram DMs with OpenAI-generated text, and logs incoming events to the console.
 
 ## Endpoints
 
 - `GET /` returns a healthcheck response.
 - `GET /webhook` handles Meta webhook verification.
-- `POST /webhook` prints the incoming request to the Render logs and returns a fast `200 OK`.
+- `POST /webhook` processes Instagram webhook events and returns a fast `200 OK`.
 
-For `dm-related` webhook events, the app also sends a reply of `Testing !` back to the message sender.
+For inbound text `dm-related` webhook events, the app generates a reply with OpenAI, keeps in-memory chat history per sender, and sends the reply back to the message sender.
 
 ## Environment variables
 
 - `META_VERIFY_TOKEN` is the verify token you will also enter in the Meta developer dashboard.
 - `INSTAGRAM_ACCESS_TOKEN` is the access token used to send Instagram DM replies through the Meta Graph API.
+- `OPENAI_API_KEY` is used to authenticate with OpenAI.
+- `OPENAI_MODEL` optionally overrides the default OpenAI model.
+- `OPENAI_SYSTEM_PROMPT` optionally overrides the default general assistant prompt.
+- `OPENAI_FALLBACK_MESSAGE` optionally overrides the fallback reply used when OpenAI fails.
 - `PORT` is provided by Render automatically.
 
 ## Run locally
@@ -60,5 +64,7 @@ Open your service in Render and check the **Logs** tab to see:
 
 - verification attempts
 - detected event type (`comment-related`, `dm-related`, or `unknown`)
+- processing results such as `replied`, `fallback_sent`, `skipped_echo`, or `skipped_read_receipt`
 - full webhook payloads
-- the send-message API response for `dm-related` events
+- the OpenAI generation result for inbound DMs
+- the send-message API response when a reply is attempted

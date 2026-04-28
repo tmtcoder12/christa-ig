@@ -6,12 +6,14 @@ import urllib.request
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
+from openai_client import generate_reply
 
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 INSTAGRAM_SEND_MESSAGE_URL = "https://graph.instagram.com/v24.0/me/messages"
+conversation_history = {}
 
 
 def classify_meta_event(payload):
@@ -36,43 +38,13 @@ def classify_meta_event(payload):
     return "unknown"
 
 
-def extract_dm_sender_id(payload):
+def get_dm_processing_info(payload):
     if not isinstance(payload, dict):
-        return None
+        return {"should_reply": False, "reason": "invalid_payload"}
 
     entries = payload.get("entry")
     if not isinstance(entries, list) or not entries:
-        return None
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-
-        messaging_items = entry.get("messaging")
-        if not isinstance(messaging_items, list):
-            continue
-
-        for item in messaging_items:
-            if not isinstance(item, dict):
-                continue
-
-            sender = item.get("sender")
-            message = item.get("message")
-            if isinstance(sender, dict) and isinstance(message, dict):
-                sender_id = sender.get("id")
-                if sender_id:
-                    return sender_id
-
-    return None
-
-
-def extract_inbound_dm_sender_id(payload):
-    if not isinstance(payload, dict):
-        return None
-
-    entries = payload.get("entry")
-    if not isinstance(entries, list) or not entries:
-        return None
+        return {"should_reply": False, "reason": "missing_entry"}
 
     for entry in entries:
         if not isinstance(entry, dict):
@@ -89,20 +61,48 @@ def extract_inbound_dm_sender_id(payload):
 
             sender = item.get("sender")
             message = item.get("message")
-            if not isinstance(sender, dict) or not isinstance(message, dict):
+            if item.get("read") is not None:
+                return {"should_reply": False, "reason": "skipped_read_receipt"}
+
+            if not isinstance(sender, dict):
                 continue
 
             sender_id = sender.get("id")
+            if sender_id == account_id:
+                return {"should_reply": False, "reason": "skipped_echo"}
+
+            if not isinstance(message, dict):
+                continue
+
+            if message.get("is_echo"):
+                return {"should_reply": False, "reason": "skipped_echo"}
+
             message_text = message.get("text")
             if not sender_id or not message_text:
                 continue
 
-            if sender_id == account_id:
-                continue
+            return {
+                "should_reply": True,
+                "reason": "inbound_text_dm",
+                "sender_id": sender_id,
+                "message_text": message_text,
+            }
 
-            return sender_id
+    return {"should_reply": False, "reason": "no_inbound_dm_sender_found"}
 
-    return None
+
+def get_user_history(sender_id):
+    return conversation_history.setdefault(sender_id, [])
+
+
+def append_user_message(sender_id, text):
+    history = get_user_history(sender_id)
+    history.append({"role": "user", "content": text})
+
+
+def append_assistant_message(sender_id, text):
+    history = get_user_history(sender_id)
+    history.append({"role": "assistant", "content": text})
 
 
 def send_instagram_dm(recipient_id, text):
@@ -188,29 +188,49 @@ def webhook():
     payload = request.get_json(silent=True)
     body_text = request.get_data(as_text=True)
     event_type = classify_meta_event(payload)
+    processing_result = "ignored"
+    openai_result = None
     send_message_response = None
 
     if event_type == "dm-related":
-        sender_id = extract_inbound_dm_sender_id(payload)
-        if sender_id:
-            send_message_response = send_instagram_dm(sender_id, "Testing !")
-        else:
-            send_message_response = {
-                "success": False,
-                "error": "No inbound dm sender found in dm-related payload",
-            }
+        dm_info = get_dm_processing_info(payload)
+        processing_result = dm_info["reason"]
+
+        if dm_info["should_reply"]:
+            sender_id = dm_info["sender_id"]
+            message_text = dm_info["message_text"]
+            append_user_message(sender_id, message_text)
+            openai_result = generate_reply(get_user_history(sender_id))
+            send_message_response = send_instagram_dm(sender_id, openai_result["reply_text"])
+
+            if send_message_response["success"]:
+                append_assistant_message(sender_id, openai_result["reply_text"])
+                processing_result = "fallback_sent" if openai_result["used_fallback"] else "replied"
+            else:
+                processing_result = "openai_failed_no_send" if openai_result["used_fallback"] else "send_failed"
 
     log_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "method": request.method,
         "path": request.path,
         "event_type": event_type,
+        "processing_result": processing_result,
         "headers": dict(request.headers),
         "query_params": request.args.to_dict(flat=False),
         "json": payload,
         "raw_body": body_text,
-        "send_message_response": send_message_response,
     }
+
+    if openai_result is not None:
+        log_entry["openai_result"] = {
+            "success": openai_result["success"],
+            "used_fallback": openai_result["used_fallback"],
+            "error": openai_result["error"],
+            "reply_text": openai_result["reply_text"],
+        }
+
+    if send_message_response is not None:
+        log_entry["send_message_response"] = send_message_response
 
     logger.info("Webhook received:\n%s", json.dumps(log_entry, indent=2, default=str))
 
