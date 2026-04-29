@@ -13,12 +13,17 @@ from supabase_client import (
     ensure_contact,
     ensure_dm_session,
     fetch_dm_history,
+    get_comment_by_instagram_id,
     get_instagram_account,
+    get_instagram_post,
+    has_prior_comment_automation,
     insert_dm_message,
     is_configured as is_supabase_configured,
     iso_from_meta_timestamp,
     message_exists,
     touch_dm_session,
+    update_comment_automation,
+    upsert_comment,
     upsert_dm_session_state,
     upsert_meta_webhook_event,
 )
@@ -28,6 +33,7 @@ app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 INSTAGRAM_SEND_MESSAGE_URL = "https://graph.instagram.com/v24.0/me/messages"
+INSTAGRAM_COMMENT_REPLIES_URL = "https://graph.instagram.com/v24.0/{comment_id}/replies"
 conversation_history = {}
 
 
@@ -107,6 +113,94 @@ def get_dm_processing_info(payload):
             }
 
     return {"should_reply": False, "reason": "no_inbound_dm_sender_found"}
+
+
+def get_comment_processing_info(payload):
+    if not isinstance(payload, dict):
+        return {"should_process": False, "reason": "invalid_payload"}
+
+    entries = payload.get("entry")
+    if not isinstance(entries, list) or not entries:
+        return {"should_process": False, "reason": "missing_entry"}
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        account_id = entry.get("id")
+        changes = entry.get("changes")
+        if not isinstance(changes, list):
+            continue
+
+        for change in changes:
+            if not isinstance(change, dict):
+                continue
+
+            value = change.get("value")
+            if not isinstance(value, dict):
+                continue
+
+            comment_text = value.get("text") or value.get("message")
+            comment_id = value.get("id") or value.get("comment_id")
+            media = value.get("media") if isinstance(value.get("media"), dict) else {}
+            media_id = media.get("id") or value.get("media_id")
+            commenter = value.get("from") if isinstance(value.get("from"), dict) else {}
+            commenter_id = commenter.get("id") or value.get("user_id")
+            commenter_username = commenter.get("username") or value.get("username")
+
+            if not comment_id or not media_id or not comment_text:
+                continue
+
+            if commenter_id and commenter_id == account_id:
+                return {"should_process": False, "reason": "skipped_self_comment"}
+
+            return {
+                "should_process": True,
+                "reason": "inbound_comment",
+                "account_id": account_id,
+                "comment_id": comment_id,
+                "media_id": media_id,
+                "commenter_id": commenter_id,
+                "commenter_username": commenter_username,
+                "comment_text": comment_text,
+                "parent_comment_id": value.get("parent_id") or value.get("parent_comment_id"),
+                "timestamp": value.get("created_time") or entry.get("time"),
+                "raw_value": value,
+            }
+
+    return {"should_process": False, "reason": "no_comment_found"}
+
+
+def find_matched_keyword(comment_text, keywords):
+    if not isinstance(comment_text, str) or not isinstance(keywords, list):
+        return None
+
+    normalized_text = comment_text.casefold()
+    for keyword in keywords:
+        if not isinstance(keyword, str):
+            continue
+
+        normalized_keyword = keyword.strip().casefold()
+        if normalized_keyword and normalized_keyword in normalized_text:
+            return keyword.strip()
+
+    return None
+
+
+def build_comment_dm_input(post, comment_info, matched_keyword):
+    campaign_prompt = post.get("dm_prompt") or ""
+    caption = post.get("caption") or ""
+    content = "\n".join(
+        [
+            "Generate a concise Instagram DM private reply for a user who commented on a promotional post.",
+            "",
+            f"Post caption: {caption}",
+            f"Campaign instructions: {campaign_prompt}",
+            f"Matched keyword: {matched_keyword}",
+            f"Comment text: {comment_info['comment_text']}",
+        ]
+    )
+    return [{"role": "user", "content": content}]
 
 
 def get_user_history(sender_id):
@@ -270,7 +364,262 @@ def process_dm_in_memory(dm_info):
     }
 
 
-def send_instagram_dm(recipient_id, text):
+def process_comment_with_database(comment_info, payload, event_type):
+    account_id = comment_info["account_id"]
+    comment_id = comment_info["comment_id"]
+    media_id = comment_info["media_id"]
+    commenter_id = comment_info.get("commenter_id")
+    comment_text = comment_info["comment_text"]
+    created_at = iso_from_meta_timestamp(comment_info.get("timestamp"))
+
+    instagram_account = get_instagram_account(account_id)
+    if not instagram_account:
+        return {
+            "processing_result": "instagram_account_not_configured",
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {"account_id": account_id, "media_id": media_id, "comment_id": comment_id},
+        }
+
+    def log_comment_event(processing_result, processing_status="ignored", error_message=None):
+        upsert_meta_webhook_event(
+            event_id=comment_id,
+            business_id=instagram_account["business_id"],
+            instagram_account_id=instagram_account["id"],
+            event_type=event_type,
+            payload=payload,
+            processing_status=processing_status,
+            error_message=error_message,
+        )
+        return processing_result
+
+    if instagram_account.get("status") != "connected":
+        processing_result = log_comment_event("instagram_account_not_connected")
+        return {
+            "processing_result": processing_result,
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "account_status": instagram_account.get("status"),
+            },
+        }
+
+    if get_comment_by_instagram_id(instagram_account["id"], comment_id):
+        processing_result = log_comment_event("duplicate_comment_ignored")
+        return {
+            "processing_result": processing_result,
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "instagram_comment_id": comment_id,
+            },
+        }
+
+    post = get_instagram_post(instagram_account["id"], media_id)
+    if not post:
+        processing_result = log_comment_event("instagram_post_not_configured")
+        return {
+            "processing_result": processing_result,
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "instagram_media_id": media_id,
+                "instagram_comment_id": comment_id,
+            },
+        }
+
+    if not commenter_id:
+        comment = upsert_comment(
+            instagram_account_id=instagram_account["id"],
+            post_id=post["id"],
+            instagram_comment_id=comment_id,
+            text=comment_text,
+            created_at_ig=created_at,
+            automation_status="error",
+            extra_metadata={"webhook_value": comment_info.get("raw_value") or {}},
+        )
+        error_message = "Comment webhook did not include commenter ID"
+        update_comment_automation(comment["id"], "error", automation_error=error_message)
+        processing_result = log_comment_event("comment_missing_commenter_id", "failed", error_message)
+        return {
+            "processing_result": processing_result,
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "post_id": post["id"],
+                "comment_id": comment["id"] if comment else None,
+            },
+        }
+
+    contact = ensure_contact(
+        instagram_account["id"],
+        commenter_id,
+        username=comment_info.get("commenter_username"),
+    )
+    base_comment_kwargs = {
+        "instagram_account_id": instagram_account["id"],
+        "post_id": post["id"],
+        "instagram_comment_id": comment_id,
+        "text": comment_text,
+        "contact_id": contact["id"],
+        "created_at_ig": created_at,
+        "extra_metadata": {"webhook_value": comment_info.get("raw_value") or {}},
+    }
+
+    if post.get("post_type") != "promotional" or not post.get("automation_enabled"):
+        comment = upsert_comment(**base_comment_kwargs)
+        processing_result = log_comment_event("comment_automation_not_applicable")
+        return {
+            "processing_result": processing_result,
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "post_id": post["id"],
+                "comment_id": comment["id"] if comment else None,
+            },
+        }
+
+    matched_keyword = find_matched_keyword(comment_text, post.get("trigger_keywords"))
+    if not matched_keyword:
+        comment = upsert_comment(**base_comment_kwargs)
+        processing_result = log_comment_event("comment_no_keyword_match")
+        return {
+            "processing_result": processing_result,
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "post_id": post["id"],
+                "comment_id": comment["id"] if comment else None,
+            },
+        }
+
+    if has_prior_comment_automation(post["id"], contact["id"]):
+        comment = upsert_comment(
+            **base_comment_kwargs,
+            automation_status="duplicate",
+            matched_keyword=matched_keyword,
+        )
+        processing_result = log_comment_event("comment_duplicate_automation")
+        return {
+            "processing_result": processing_result,
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "post_id": post["id"],
+                "comment_id": comment["id"] if comment else None,
+                "contact_id": contact["id"],
+            },
+        }
+
+    comment = upsert_comment(
+        **base_comment_kwargs,
+        automation_status="pending",
+        matched_keyword=matched_keyword,
+    )
+    session = ensure_dm_session(instagram_account["id"], contact["id"])
+    touch_dm_session(session["id"])
+
+    public_reply_response = reply_to_instagram_comment(
+        comment_id,
+        post.get("comment_reply_text") or "Sent you a DM!",
+    )
+    public_reply_id = get_sent_instagram_message_id(public_reply_response)
+    public_error = None if public_reply_response["success"] else public_reply_response.get("error")
+
+    started_at = time.perf_counter()
+    openai_result = generate_reply(
+        build_comment_dm_input(post, comment_info, matched_keyword),
+        system_prompt=instagram_account.get("system_prompt"),
+    )
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    openai_error = openai_result.get("error") if openai_result["used_fallback"] else None
+
+    private_reply_response = send_instagram_private_reply(comment_id, openai_result["reply_text"])
+    private_reply_id = get_sent_instagram_message_id(private_reply_response)
+    private_error = None if private_reply_response["success"] else private_reply_response.get("error")
+    delivery_status = "sent" if private_reply_response["success"] else "failed"
+    automation_errors = [error for error in [public_error, openai_error, private_error] if error]
+    automation_error = "\n".join(automation_errors) if automation_errors else None
+
+    assistant_message = insert_dm_message(
+        session_id=session["id"],
+        contact_id=contact["id"],
+        role="assistant",
+        direction="outbound",
+        content=openai_result["reply_text"],
+        instagram_message_id=private_reply_id,
+        delivery_status=delivery_status,
+        model=openai_result.get("model"),
+        token_usage=openai_result.get("token_usage"),
+        latency_ms=latency_ms,
+        error_message=automation_error,
+    )
+
+    if private_error:
+        automation_status = "private_reply_failed"
+        processing_result = "comment_private_reply_failed"
+        processing_status = "failed"
+    elif openai_error:
+        automation_status = "openai_failed"
+        processing_result = "comment_openai_failed"
+        processing_status = "processed"
+    elif public_error:
+        automation_status = "comment_reply_failed"
+        processing_result = "comment_public_reply_failed"
+        processing_status = "processed"
+    else:
+        automation_status = "sent"
+        processing_result = "comment_automation_sent"
+        processing_status = "processed"
+
+    update_comment_automation(
+        comment["id"],
+        automation_status,
+        public_reply_comment_id=public_reply_id,
+        private_reply_message_id=private_reply_id,
+        automation_error=automation_error,
+    )
+    upsert_dm_session_state(
+        session["id"],
+        last_response_id=openai_result.get("response_id"),
+        summary=f"Last comment: {comment_text}\nLast private reply: {openai_result['reply_text']}",
+    )
+    touch_dm_session(session["id"])
+    log_comment_event(processing_result, processing_status, automation_error)
+
+    return {
+        "processing_result": processing_result,
+        "openai_result": openai_result,
+        "public_reply_response": public_reply_response,
+        "private_reply_response": private_reply_response,
+        "db_result": {
+            "business_id": instagram_account["business_id"],
+            "instagram_account_id": instagram_account["id"],
+            "post_id": post["id"],
+            "comment_id": comment["id"] if comment else None,
+            "contact_id": contact["id"],
+            "session_id": session["id"],
+            "assistant_message_id": assistant_message["id"] if assistant_message else None,
+        },
+    }
+
+
+def send_instagram_api_request(url, body):
     access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
 
     if not access_token:
@@ -279,15 +628,10 @@ def send_instagram_dm(recipient_id, text):
             "error": "INSTAGRAM_ACCESS_TOKEN is not set",
         }
 
-    body = json.dumps(
-        {
-            "recipient": {"id": recipient_id},
-            "message": {"text": text},
-        }
-    ).encode("utf-8")
+    encoded_body = json.dumps(body).encode("utf-8")
     api_request = urllib.request.Request(
-        INSTAGRAM_SEND_MESSAGE_URL,
-        data=body,
+        url,
+        data=encoded_body,
         headers={
             "Authorization": f"Bearer {access_token}",
             "Content-Type": "application/json",
@@ -323,6 +667,33 @@ def send_instagram_dm(recipient_id, text):
         }
 
 
+def send_instagram_dm(recipient_id, text):
+    return send_instagram_api_request(
+        INSTAGRAM_SEND_MESSAGE_URL,
+        {
+            "recipient": {"id": recipient_id},
+            "message": {"text": text},
+        },
+    )
+
+
+def send_instagram_private_reply(comment_id, text):
+    return send_instagram_api_request(
+        INSTAGRAM_SEND_MESSAGE_URL,
+        {
+            "recipient": {"comment_id": comment_id},
+            "message": {"text": text},
+        },
+    )
+
+
+def reply_to_instagram_comment(comment_id, text):
+    return send_instagram_api_request(
+        INSTAGRAM_COMMENT_REPLIES_URL.format(comment_id=comment_id),
+        {"message": text},
+    )
+
+
 @app.get("/")
 def healthcheck():
     return jsonify({"status": "ok"})
@@ -356,6 +727,8 @@ def webhook():
     processing_result = "ignored"
     openai_result = None
     send_message_response = None
+    public_reply_response = None
+    private_reply_response = None
     db_result = None
 
     if event_type == "dm-related":
@@ -376,6 +749,26 @@ def webhook():
                 db_result = dm_result["db_result"]
             except SupabaseError as exc:
                 logger.exception("Failed to persist inbound Instagram DM")
+                processing_result = "db_error"
+                db_result = {"error": str(exc)}
+    elif event_type == "comment-related":
+        comment_info = get_comment_processing_info(payload)
+        processing_result = comment_info["reason"]
+
+        if comment_info["should_process"]:
+            try:
+                if is_supabase_configured():
+                    comment_result = process_comment_with_database(comment_info, payload, event_type)
+                    processing_result = comment_result["processing_result"]
+                    openai_result = comment_result["openai_result"]
+                    public_reply_response = comment_result["public_reply_response"]
+                    private_reply_response = comment_result["private_reply_response"]
+                    db_result = comment_result["db_result"]
+                else:
+                    logger.warning("Supabase is not configured; comment automation is disabled.")
+                    processing_result = "comment_automation_requires_database"
+            except SupabaseError as exc:
+                logger.exception("Failed to process inbound Instagram comment")
                 processing_result = "db_error"
                 db_result = {"error": str(exc)}
 
@@ -403,6 +796,12 @@ def webhook():
 
     if send_message_response is not None:
         log_entry["send_message_response"] = send_message_response
+
+    if public_reply_response is not None:
+        log_entry["public_reply_response"] = public_reply_response
+
+    if private_reply_response is not None:
+        log_entry["private_reply_response"] = private_reply_response
 
     if db_result is not None:
         log_entry["db_result"] = db_result

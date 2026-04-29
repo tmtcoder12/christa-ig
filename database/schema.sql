@@ -196,6 +196,14 @@ create table if not exists public.ig_posts (
   media_url text,
   permalink text,
   posted_at timestamp with time zone,
+  post_type text not null default 'regular' check (
+    post_type = any (array['regular', 'promotional'])
+  ),
+  automation_enabled boolean not null default false,
+  trigger_keywords jsonb not null default '[]'::jsonb,
+  comment_reply_text text not null default 'Sent you a DM!',
+  dm_prompt text,
+  promotion_metadata jsonb not null default '{}'::jsonb,
   like_count integer not null default 0 check (like_count >= 0),
   comment_count integer not null default 0 check (comment_count >= 0),
   extra_metadata jsonb not null default '{}'::jsonb,
@@ -216,6 +224,24 @@ create table if not exists public.ig_comments (
   like_count integer not null default 0 check (like_count >= 0),
   hidden boolean not null default false,
   replied_to boolean not null default false,
+  automation_status text not null default 'not_applicable' check (
+    automation_status = any (
+      array[
+        'not_applicable',
+        'pending',
+        'sent',
+        'duplicate',
+        'comment_reply_failed',
+        'private_reply_failed',
+        'openai_failed',
+        'error'
+      ]
+    )
+  ),
+  matched_keyword text,
+  public_reply_comment_id text,
+  private_reply_message_id text,
+  automation_error text,
   created_at_ig timestamp with time zone,
   extra_metadata jsonb not null default '{}'::jsonb,
   created_at timestamp with time zone not null default now(),
@@ -288,6 +314,20 @@ create index if not exists ig_comments_post_created_idx
 
 create index if not exists ig_comments_account_comment_idx
   on public.ig_comments (instagram_account_id, instagram_comment_id);
+
+create unique index if not exists ig_comments_one_automation_per_post_contact_idx
+  on public.ig_comments (post_id, contact_id)
+  where contact_id is not null
+    and automation_status = any (
+      array[
+        'pending',
+        'sent',
+        'comment_reply_failed',
+        'private_reply_failed',
+        'openai_failed',
+        'error'
+      ]
+    );
 
 create index if not exists ig_comment_classifications_comment_classified_idx
   on public.ig_comment_classifications (comment_id, classified_at desc);

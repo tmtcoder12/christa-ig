@@ -22,7 +22,10 @@ def iso_from_meta_timestamp(timestamp_ms):
         return None
 
     try:
-        return datetime.fromtimestamp(int(timestamp_ms) / 1000, timezone.utc).isoformat()
+        timestamp = int(timestamp_ms)
+        if timestamp > 10_000_000_000:
+            timestamp = timestamp / 1000
+        return datetime.fromtimestamp(timestamp, timezone.utc).isoformat()
     except (TypeError, ValueError, OSError):
         return None
 
@@ -115,16 +118,110 @@ def get_instagram_account(instagram_user_id):
     )
 
 
-def ensure_contact(instagram_account_id, sender_id):
-    return _upsert(
-        "ig_contacts",
+def ensure_contact(instagram_account_id, sender_id, username=None):
+    row = {
+        "instagram_account_id": instagram_account_id,
+        "instagram_user_id": sender_id,
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if username:
+        row["username"] = username
+
+    return _upsert("ig_contacts", row, "instagram_account_id,instagram_user_id")
+
+
+def get_instagram_post(instagram_account_id, instagram_media_id):
+    return _fetch_one(
+        "ig_posts",
         {
-            "instagram_account_id": instagram_account_id,
-            "instagram_user_id": sender_id,
-            "last_seen_at": datetime.now(timezone.utc).isoformat(),
+            "instagram_account_id": f"eq.{instagram_account_id}",
+            "instagram_media_id": f"eq.{instagram_media_id}",
+            "select": (
+                "id,instagram_account_id,instagram_media_id,caption,post_type,"
+                "automation_enabled,trigger_keywords,comment_reply_text,dm_prompt,"
+                "promotion_metadata"
+            ),
         },
-        "instagram_account_id,instagram_user_id",
     )
+
+
+def get_comment_by_instagram_id(instagram_account_id, instagram_comment_id):
+    return _fetch_one(
+        "ig_comments",
+        {
+            "instagram_account_id": f"eq.{instagram_account_id}",
+            "instagram_comment_id": f"eq.{instagram_comment_id}",
+            "select": "id,post_id,contact_id,automation_status",
+        },
+    )
+
+
+def has_prior_comment_automation(post_id, contact_id):
+    if not post_id or not contact_id:
+        return False
+
+    existing = _fetch_one(
+        "ig_comments",
+        {
+            "post_id": f"eq.{post_id}",
+            "contact_id": f"eq.{contact_id}",
+            "automation_status": "in.(pending,sent,comment_reply_failed,private_reply_failed,openai_failed,error)",
+            "select": "id",
+        },
+    )
+    return existing is not None
+
+
+def upsert_comment(
+    instagram_account_id,
+    post_id,
+    instagram_comment_id,
+    text,
+    contact_id=None,
+    parent_comment_id=None,
+    created_at_ig=None,
+    automation_status="not_applicable",
+    matched_keyword=None,
+    extra_metadata=None,
+):
+    row = {
+        "instagram_account_id": instagram_account_id,
+        "post_id": post_id,
+        "instagram_comment_id": instagram_comment_id,
+        "text": text,
+        "automation_status": automation_status,
+        "extra_metadata": extra_metadata or {},
+    }
+
+    if contact_id:
+        row["contact_id"] = contact_id
+    if parent_comment_id:
+        row["parent_comment_id"] = parent_comment_id
+    if created_at_ig:
+        row["created_at_ig"] = created_at_ig
+    if matched_keyword:
+        row["matched_keyword"] = matched_keyword
+
+    return _upsert("ig_comments", row, "instagram_account_id,instagram_comment_id")
+
+
+def update_comment_automation(
+    comment_id,
+    automation_status,
+    public_reply_comment_id=None,
+    private_reply_message_id=None,
+    automation_error=None,
+):
+    patch = {"automation_status": automation_status}
+    if public_reply_comment_id:
+        patch["public_reply_comment_id"] = public_reply_comment_id
+        patch["replied_to"] = True
+    if private_reply_message_id:
+        patch["private_reply_message_id"] = private_reply_message_id
+    if automation_error:
+        patch["automation_error"] = automation_error
+
+    return _patch("ig_comments", {"id": f"eq.{comment_id}"}, patch)
 
 
 def ensure_dm_session(instagram_account_id, contact_id):
