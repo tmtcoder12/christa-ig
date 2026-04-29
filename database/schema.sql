@@ -23,7 +23,6 @@ create table if not exists public.businesses (
   id uuid primary key default gen_random_uuid(),
   slug text unique,
   name text,
-  system_prompt text not null default 'You are a helpful assistant responding to Instagram direct messages.',
   created_at timestamp with time zone not null default now(),
   updated_at timestamp with time zone not null default now()
 );
@@ -96,6 +95,7 @@ create table if not exists public.instagram_accounts (
   name text,
   profile_picture_url text,
   access_token_secret_ref text,
+  system_prompt text not null default 'You are a helpful assistant responding to Instagram direct messages.',
   status text not null default 'connected' check (
     status = any (array['connected', 'disconnected', 'error'])
   ),

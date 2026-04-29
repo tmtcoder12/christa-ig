@@ -110,17 +110,7 @@ def get_instagram_account(instagram_user_id):
         "instagram_accounts",
         {
             "instagram_user_id": f"eq.{instagram_user_id}",
-            "select": "id,business_id,instagram_user_id,username,status",
-        },
-    )
-
-
-def get_business(business_id):
-    return _fetch_one(
-        "businesses",
-        {
-            "id": f"eq.{business_id}",
-            "select": "id,name,system_prompt",
+            "select": "id,business_id,instagram_user_id,username,status,system_prompt",
         },
     )
 

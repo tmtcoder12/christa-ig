@@ -18,7 +18,7 @@ For inbound text `dm-related` webhook events, the app looks up the connected Ins
 - `SUPABASE_SERVICE_ROLE_KEY` is used by the backend webhook to insert and update tenant data. Keep this server-side only.
 - `OPENAI_API_KEY` is used to authenticate with OpenAI.
 - `OPENAI_MODEL` optionally overrides the default OpenAI model.
-- `OPENAI_SYSTEM_PROMPT` optionally overrides the default general assistant prompt.
+- `OPENAI_SYSTEM_PROMPT` optionally overrides the default general assistant prompt when no account-specific prompt is provided.
 - `OPENAI_FALLBACK_MESSAGE` optionally overrides the fallback reply used when OpenAI fails.
 - `PORT` is provided by Render automatically.
 
@@ -45,7 +45,7 @@ Before the webhook can persist a DM, the receiving Instagram account must exist 
 }
 ```
 
-Seed `instagram_accounts.instagram_user_id` with `17841476354816630`. The webhook will create or update the `ig_contacts` row for `25391124670525123`, then create the DM session and messages.
+Seed `instagram_accounts.instagram_user_id` with `17841476354816630`. Set `instagram_accounts.system_prompt` to control the assistant instructions for that Instagram account. The webhook will create or update the `ig_contacts` row for `25391124670525123`, then create the DM session and messages.
 
 If `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` is missing, local development falls back to the old in-memory history behavior.
 

@@ -13,7 +13,6 @@ from supabase_client import (
     ensure_contact,
     ensure_dm_session,
     fetch_dm_history,
-    get_business,
     get_instagram_account,
     insert_dm_message,
     is_configured as is_supabase_configured,
@@ -187,12 +186,11 @@ def process_dm_with_database(dm_info, payload, event_type):
     )
     touch_dm_session(session["id"])
 
-    business = get_business(instagram_account["business_id"])
     history = fetch_dm_history(session["id"])
     started_at = time.perf_counter()
     openai_result = generate_reply(
         history,
-        system_prompt=(business or {}).get("system_prompt"),
+        system_prompt=instagram_account.get("system_prompt"),
     )
     latency_ms = int((time.perf_counter() - started_at) * 1000)
     send_message_response = send_instagram_dm(sender_id, openai_result["reply_text"])
