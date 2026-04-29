@@ -13,7 +13,21 @@ def _trim_history(history):
     return history[-MAX_HISTORY_MESSAGES:]
 
 
-def generate_reply(history):
+def _serialize_usage(response):
+    usage = getattr(response, "usage", None)
+    if usage is None:
+        return {}
+
+    if hasattr(usage, "model_dump"):
+        return usage.model_dump()
+
+    if isinstance(usage, dict):
+        return usage
+
+    return {}
+
+
+def generate_reply(history, system_prompt=None):
     api_key = os.environ.get("OPENAI_API_KEY")
     fallback_message = os.environ.get("OPENAI_FALLBACK_MESSAGE", DEFAULT_FALLBACK_MESSAGE)
 
@@ -23,11 +37,14 @@ def generate_reply(history):
             "reply_text": fallback_message,
             "error": "OPENAI_API_KEY is not set",
             "used_fallback": True,
+            "model": os.environ.get("OPENAI_MODEL", DEFAULT_MODEL),
+            "response_id": None,
+            "token_usage": {},
         }
 
     client = OpenAI(api_key=api_key)
     model = os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
-    system_prompt = os.environ.get("OPENAI_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
+    system_prompt = system_prompt or os.environ.get("OPENAI_SYSTEM_PROMPT", DEFAULT_SYSTEM_PROMPT)
     trimmed_history = _trim_history(history)
 
     try:
@@ -43,6 +60,9 @@ def generate_reply(history):
                 "reply_text": reply_text,
                 "error": None,
                 "used_fallback": False,
+                "model": model,
+                "response_id": getattr(response, "id", None),
+                "token_usage": _serialize_usage(response),
             }
 
         return {
@@ -50,6 +70,9 @@ def generate_reply(history):
             "reply_text": fallback_message,
             "error": "OpenAI response did not contain text",
             "used_fallback": True,
+            "model": model,
+            "response_id": getattr(response, "id", None),
+            "token_usage": _serialize_usage(response),
         }
     except Exception as exc:
         return {
@@ -57,4 +80,7 @@ def generate_reply(history):
             "reply_text": fallback_message,
             "error": str(exc),
             "used_fallback": True,
+            "model": model,
+            "response_id": None,
+            "token_usage": {},
         }

@@ -1,12 +1,28 @@
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
 from openai_client import generate_reply
+from supabase_client import (
+    SupabaseError,
+    ensure_contact,
+    ensure_dm_session,
+    fetch_dm_history,
+    get_business,
+    get_instagram_account,
+    insert_dm_message,
+    is_configured as is_supabase_configured,
+    iso_from_meta_timestamp,
+    message_exists,
+    touch_dm_session,
+    upsert_dm_session_state,
+    upsert_meta_webhook_event,
+)
 
 
 app = Flask(__name__)
@@ -84,8 +100,11 @@ def get_dm_processing_info(payload):
             return {
                 "should_reply": True,
                 "reason": "inbound_text_dm",
+                "account_id": account_id,
                 "sender_id": sender_id,
                 "message_text": message_text,
+                "message_id": message.get("mid"),
+                "timestamp": item.get("timestamp") or entry.get("time"),
             }
 
     return {"should_reply": False, "reason": "no_inbound_dm_sender_found"}
@@ -103,6 +122,154 @@ def append_user_message(sender_id, text):
 def append_assistant_message(sender_id, text):
     history = get_user_history(sender_id)
     history.append({"role": "assistant", "content": text})
+
+
+def get_sent_instagram_message_id(send_message_response):
+    data = send_message_response.get("data")
+    if not isinstance(data, dict):
+        return None
+
+    return data.get("message_id") or data.get("id")
+
+
+def process_dm_with_database(dm_info, payload, event_type):
+    account_id = dm_info["account_id"]
+    sender_id = dm_info["sender_id"]
+    message_text = dm_info["message_text"]
+    inbound_message_id = dm_info.get("message_id")
+    created_at = iso_from_meta_timestamp(dm_info.get("timestamp"))
+
+    instagram_account = get_instagram_account(account_id)
+    if not instagram_account:
+        return {
+            "processing_result": "instagram_account_not_configured",
+            "openai_result": None,
+            "send_message_response": None,
+            "db_result": {
+                "account_id": account_id,
+                "sender_id": sender_id,
+            },
+        }
+
+    if instagram_account.get("status") != "connected":
+        return {
+            "processing_result": "instagram_account_not_connected",
+            "openai_result": None,
+            "send_message_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "account_status": instagram_account.get("status"),
+            },
+        }
+
+    if inbound_message_id and message_exists(inbound_message_id):
+        return {
+            "processing_result": "duplicate_dm_ignored",
+            "openai_result": None,
+            "send_message_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "instagram_message_id": inbound_message_id,
+            },
+        }
+
+    contact = ensure_contact(instagram_account["id"], sender_id)
+    session = ensure_dm_session(instagram_account["id"], contact["id"])
+    inbound_message = insert_dm_message(
+        session_id=session["id"],
+        contact_id=contact["id"],
+        role="user",
+        direction="inbound",
+        content=message_text,
+        instagram_message_id=inbound_message_id,
+        delivery_status="received",
+        created_at=created_at,
+    )
+    touch_dm_session(session["id"])
+
+    business = get_business(instagram_account["business_id"])
+    history = fetch_dm_history(session["id"])
+    started_at = time.perf_counter()
+    openai_result = generate_reply(
+        history,
+        system_prompt=(business or {}).get("system_prompt"),
+    )
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    send_message_response = send_instagram_dm(sender_id, openai_result["reply_text"])
+    sent_message_id = get_sent_instagram_message_id(send_message_response)
+
+    if send_message_response["success"]:
+        delivery_status = "sent"
+        error_message = None
+        processing_result = "fallback_sent" if openai_result["used_fallback"] else "replied"
+    else:
+        delivery_status = "failed"
+        error_message = send_message_response.get("error")
+        processing_result = "openai_failed_no_send" if openai_result["used_fallback"] else "send_failed"
+
+    assistant_message = insert_dm_message(
+        session_id=session["id"],
+        contact_id=contact["id"],
+        role="assistant",
+        direction="outbound",
+        content=openai_result["reply_text"],
+        instagram_message_id=sent_message_id,
+        delivery_status=delivery_status,
+        model=openai_result.get("model"),
+        token_usage=openai_result.get("token_usage"),
+        latency_ms=latency_ms,
+        error_message=error_message or openai_result.get("error"),
+    )
+    upsert_dm_session_state(
+        session["id"],
+        last_response_id=openai_result.get("response_id"),
+        summary=f"Last inbound: {message_text}\nLast assistant: {openai_result['reply_text']}",
+    )
+    touch_dm_session(session["id"])
+    upsert_meta_webhook_event(
+        event_id=inbound_message_id,
+        business_id=instagram_account["business_id"],
+        instagram_account_id=instagram_account["id"],
+        event_type=event_type,
+        payload=payload,
+        processing_status="processed" if send_message_response["success"] else "failed",
+        error_message=error_message,
+    )
+
+    return {
+        "processing_result": processing_result,
+        "openai_result": openai_result,
+        "send_message_response": send_message_response,
+        "db_result": {
+            "business_id": instagram_account["business_id"],
+            "instagram_account_id": instagram_account["id"],
+            "contact_id": contact["id"],
+            "session_id": session["id"],
+            "inbound_message_id": inbound_message["id"] if inbound_message else None,
+            "assistant_message_id": assistant_message["id"] if assistant_message else None,
+        },
+    }
+
+
+def process_dm_in_memory(dm_info):
+    sender_id = dm_info["sender_id"]
+    message_text = dm_info["message_text"]
+    append_user_message(sender_id, message_text)
+    openai_result = generate_reply(get_user_history(sender_id))
+    send_message_response = send_instagram_dm(sender_id, openai_result["reply_text"])
+
+    if send_message_response["success"]:
+        append_assistant_message(sender_id, openai_result["reply_text"])
+        processing_result = "fallback_sent" if openai_result["used_fallback"] else "replied"
+    else:
+        processing_result = "openai_failed_no_send" if openai_result["used_fallback"] else "send_failed"
+
+    return {
+        "processing_result": processing_result,
+        "openai_result": openai_result,
+        "send_message_response": send_message_response,
+        "db_result": None,
+    }
 
 
 def send_instagram_dm(recipient_id, text):
@@ -191,23 +358,28 @@ def webhook():
     processing_result = "ignored"
     openai_result = None
     send_message_response = None
+    db_result = None
 
     if event_type == "dm-related":
         dm_info = get_dm_processing_info(payload)
         processing_result = dm_info["reason"]
 
         if dm_info["should_reply"]:
-            sender_id = dm_info["sender_id"]
-            message_text = dm_info["message_text"]
-            append_user_message(sender_id, message_text)
-            openai_result = generate_reply(get_user_history(sender_id))
-            send_message_response = send_instagram_dm(sender_id, openai_result["reply_text"])
+            try:
+                if is_supabase_configured():
+                    dm_result = process_dm_with_database(dm_info, payload, event_type)
+                else:
+                    logger.warning("Supabase is not configured; using in-memory DM history.")
+                    dm_result = process_dm_in_memory(dm_info)
 
-            if send_message_response["success"]:
-                append_assistant_message(sender_id, openai_result["reply_text"])
-                processing_result = "fallback_sent" if openai_result["used_fallback"] else "replied"
-            else:
-                processing_result = "openai_failed_no_send" if openai_result["used_fallback"] else "send_failed"
+                processing_result = dm_result["processing_result"]
+                openai_result = dm_result["openai_result"]
+                send_message_response = dm_result["send_message_response"]
+                db_result = dm_result["db_result"]
+            except SupabaseError as exc:
+                logger.exception("Failed to persist inbound Instagram DM")
+                processing_result = "db_error"
+                db_result = {"error": str(exc)}
 
     log_entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
@@ -227,10 +399,15 @@ def webhook():
             "used_fallback": openai_result["used_fallback"],
             "error": openai_result["error"],
             "reply_text": openai_result["reply_text"],
+            "model": openai_result.get("model"),
+            "response_id": openai_result.get("response_id"),
         }
 
     if send_message_response is not None:
         log_entry["send_message_response"] = send_message_response
+
+    if db_result is not None:
+        log_entry["db_result"] = db_result
 
     logger.info("Webhook received:\n%s", json.dumps(log_entry, indent=2, default=str))
 

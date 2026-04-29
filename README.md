@@ -8,17 +8,46 @@ This is a Flask app for receiving Meta webhook requests on Render. It supports w
 - `GET /webhook` handles Meta webhook verification.
 - `POST /webhook` processes Instagram webhook events and returns a fast `200 OK`.
 
-For inbound text `dm-related` webhook events, the app generates a reply with OpenAI, keeps in-memory chat history per sender, and sends the reply back to the message sender.
+For inbound text `dm-related` webhook events, the app looks up the connected Instagram account in Supabase, persists the contact/session/messages, generates a reply with OpenAI from database-backed chat history, stores the assistant reply, and sends the reply back to the message sender.
 
 ## Environment variables
 
 - `META_VERIFY_TOKEN` is the verify token you will also enter in the Meta developer dashboard.
 - `INSTAGRAM_ACCESS_TOKEN` is the access token used to send Instagram DM replies through the Meta Graph API.
+- `SUPABASE_URL` is your Supabase project URL.
+- `SUPABASE_SERVICE_ROLE_KEY` is used by the backend webhook to insert and update tenant data. Keep this server-side only.
 - `OPENAI_API_KEY` is used to authenticate with OpenAI.
 - `OPENAI_MODEL` optionally overrides the default OpenAI model.
 - `OPENAI_SYSTEM_PROMPT` optionally overrides the default general assistant prompt.
 - `OPENAI_FALLBACK_MESSAGE` optionally overrides the fallback reply used when OpenAI fails.
 - `PORT` is provided by Render automatically.
+
+## Supabase setup
+
+Run the schema in `database/schema.sql` in your Supabase SQL editor or with `psql`.
+
+Before the webhook can persist a DM, the receiving Instagram account must exist in `instagram_accounts`. In Meta DM webhooks, `entry.id` is your business Instagram account ID and `messaging[].sender.id` is the contact. For example, with this payload:
+
+```json
+{
+  "entry": [
+    {
+      "id": "17841476354816630",
+      "messaging": [
+        {
+          "sender": {
+            "id": "25391124670525123"
+          }
+        }
+      ]
+    }
+  ]
+}
+```
+
+Seed `instagram_accounts.instagram_user_id` with `17841476354816630`. The webhook will create or update the `ig_contacts` row for `25391124670525123`, then create the DM session and messages.
+
+If `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` is missing, local development falls back to the old in-memory history behavior.
 
 ## Run locally
 
@@ -32,7 +61,30 @@ Then send a test request:
 ```bash
 curl -X POST http://localhost:5000/webhook \
   -H "Content-Type: application/json" \
-  -d '{"message":"hello from webhook"}'
+  -d '{
+    "object": "instagram",
+    "entry": [
+      {
+        "time": 1777318396685,
+        "id": "17841476354816630",
+        "messaging": [
+          {
+            "sender": {
+              "id": "25391124670525123"
+            },
+            "recipient": {
+              "id": "17841476354816630"
+            },
+            "timestamp": 1777318396235,
+            "message": {
+              "mid": "local-test-message-1",
+              "text": "Qwerty"
+            }
+          }
+        ]
+      }
+    ]
+  }'
 ```
 
 Test Meta verification locally:
@@ -64,7 +116,8 @@ Open your service in Render and check the **Logs** tab to see:
 
 - verification attempts
 - detected event type (`comment-related`, `dm-related`, or `unknown`)
-- processing results such as `replied`, `fallback_sent`, `skipped_echo`, or `skipped_read_receipt`
+- processing results such as `replied`, `fallback_sent`, `duplicate_dm_ignored`, `instagram_account_not_configured`, `skipped_echo`, or `skipped_read_receipt`
 - full webhook payloads
+- the Supabase IDs for the business, Instagram account, contact, session, and messages
 - the OpenAI generation result for inbound DMs
 - the send-message API response when a reply is attempted
