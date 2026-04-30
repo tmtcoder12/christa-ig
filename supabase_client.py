@@ -108,6 +108,10 @@ def _patch(table, filters, patch):
     return _request("PATCH", table, params=filters, payload=patch, prefer="return=minimal")
 
 
+def _rpc(function_name, payload):
+    return _request("POST", f"rpc/{function_name}", payload=payload)
+
+
 def get_instagram_account(instagram_user_id):
     return _fetch_one(
         "instagram_accounts",
@@ -116,6 +120,21 @@ def get_instagram_account(instagram_user_id):
             "select": "id,business_id,instagram_user_id,username,status,system_prompt",
         },
     )
+
+
+def match_knowledge_chunks(instagram_account_id, query_embedding, match_count=5):
+    if not instagram_account_id or not query_embedding:
+        return []
+
+    rows = _rpc(
+        "match_knowledge_chunks",
+        {
+            "p_instagram_account_id": instagram_account_id,
+            "p_query_embedding": query_embedding,
+            "p_match_count": match_count,
+        },
+    )
+    return rows or []
 
 
 def ensure_contact(instagram_account_id, sender_id, username=None):

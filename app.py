@@ -7,7 +7,7 @@ import urllib.request
 from datetime import datetime, timezone
 
 from flask import Flask, jsonify, request
-from openai_client import generate_reply
+from openai_client import generate_query_embedding, generate_reply
 from supabase_client import (
     SupabaseError,
     ensure_contact,
@@ -20,6 +20,7 @@ from supabase_client import (
     insert_dm_message,
     is_configured as is_supabase_configured,
     iso_from_meta_timestamp,
+    match_knowledge_chunks,
     message_exists,
     touch_dm_session,
     update_comment_automation,
@@ -35,6 +36,24 @@ logger = logging.getLogger(__name__)
 INSTAGRAM_SEND_MESSAGE_URL = "https://graph.instagram.com/v24.0/me/messages"
 INSTAGRAM_COMMENT_REPLIES_URL = "https://graph.instagram.com/v24.0/{comment_id}/replies"
 conversation_history = {}
+
+
+def parse_bool_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_int_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def classify_meta_event(payload):
@@ -203,6 +222,26 @@ def build_comment_dm_input(post, comment_info, matched_keyword):
     return [{"role": "user", "content": content}]
 
 
+def retrieve_knowledge_context(instagram_account_id, query_text):
+    if not parse_bool_env("RAG_ENABLED", True):
+        return {"chunks": [], "error": None, "enabled": False}
+
+    if not instagram_account_id or not query_text:
+        return {"chunks": [], "error": None, "enabled": True}
+
+    try:
+        query_embedding = generate_query_embedding(query_text)
+        chunks = match_knowledge_chunks(
+            instagram_account_id,
+            query_embedding,
+            match_count=parse_int_env("RAG_MATCH_COUNT", 5),
+        )
+        return {"chunks": chunks, "error": None, "enabled": True}
+    except Exception as exc:  # noqa: BLE001 - retrieval should not block replies.
+        logger.warning("RAG retrieval failed for Instagram account %s: %s", instagram_account_id, exc)
+        return {"chunks": [], "error": str(exc), "enabled": True}
+
+
 def get_user_history(sender_id):
     return conversation_history.setdefault(sender_id, [])
 
@@ -281,10 +320,12 @@ def process_dm_with_database(dm_info, payload, event_type):
     touch_dm_session(session["id"])
 
     history = fetch_dm_history(session["id"])
+    rag_result = retrieve_knowledge_context(instagram_account["id"], message_text)
     started_at = time.perf_counter()
     openai_result = generate_reply(
         history,
         system_prompt=instagram_account.get("system_prompt"),
+        knowledge_context=rag_result["chunks"],
     )
     latency_ms = int((time.perf_counter() - started_at) * 1000)
     send_message_response = send_instagram_dm(sender_id, openai_result["reply_text"])
@@ -339,6 +380,11 @@ def process_dm_with_database(dm_info, payload, event_type):
             "session_id": session["id"],
             "inbound_message_id": inbound_message["id"] if inbound_message else None,
             "assistant_message_id": assistant_message["id"] if assistant_message else None,
+            "rag": {
+                "enabled": rag_result["enabled"],
+                "match_count": len(rag_result["chunks"]),
+                "error": rag_result["error"],
+            },
         },
     }
 
@@ -541,10 +587,21 @@ def process_comment_with_database(comment_info, payload, event_type):
     public_reply_id = get_sent_instagram_message_id(public_reply_response)
     public_error = None if public_reply_response["success"] else public_reply_response.get("error")
 
+    rag_query = "\n".join(
+        part
+        for part in [
+            post.get("dm_prompt") or "",
+            matched_keyword or "",
+            comment_text,
+        ]
+        if part
+    )
+    rag_result = retrieve_knowledge_context(instagram_account["id"], rag_query)
     started_at = time.perf_counter()
     openai_result = generate_reply(
         build_comment_dm_input(post, comment_info, matched_keyword),
         system_prompt=instagram_account.get("system_prompt"),
+        knowledge_context=rag_result["chunks"],
     )
     latency_ms = int((time.perf_counter() - started_at) * 1000)
     openai_error = openai_result.get("error") if openai_result["used_fallback"] else None
@@ -615,6 +672,11 @@ def process_comment_with_database(comment_info, payload, event_type):
             "contact_id": contact["id"],
             "session_id": session["id"],
             "assistant_message_id": assistant_message["id"] if assistant_message else None,
+            "rag": {
+                "enabled": rag_result["enabled"],
+                "match_count": len(rag_result["chunks"]),
+                "error": rag_result["error"],
+            },
         },
     }
 
@@ -792,6 +854,7 @@ def webhook():
             "reply_text": openai_result["reply_text"],
             "model": openai_result.get("model"),
             "response_id": openai_result.get("response_id"),
+            "knowledge_context_count": openai_result.get("knowledge_context_count"),
         }
 
     if send_message_response is not None:
