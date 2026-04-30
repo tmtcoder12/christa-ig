@@ -2,6 +2,7 @@
 -- Intended to be run on a fresh database or adapted into a migration.
 
 create extension if not exists pgcrypto;
+create extension if not exists vector;
 
 create or replace function public.set_updated_at()
 returns trigger
@@ -104,6 +105,55 @@ create table if not exists public.instagram_accounts (
   updated_at timestamp with time zone not null default now(),
   unique (id, business_id),
   unique (business_id, instagram_user_id)
+);
+
+create table if not exists public.knowledge_chunks (
+  id uuid primary key default gen_random_uuid(),
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  text text not null,
+  type text,
+  source_url text,
+  page_path text,
+  title text,
+  meta_description text,
+  extra_metadata jsonb not null default '{}'::jsonb,
+  content_hash text,
+  embedding public.vector(1536) not null,
+  created_at timestamp with time zone not null default now()
+);
+
+create table if not exists public.deleted_knowledge_chunks (
+  id uuid primary key default gen_random_uuid(),
+  original_chunk_id text not null,
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  deleted_by uuid not null references public.profiles(id) on delete restrict,
+  deleted_at timestamp with time zone not null default now(),
+  delete_reason text,
+  text text not null,
+  type text,
+  source_url text,
+  page_path text,
+  title text,
+  meta_description text,
+  extra_metadata jsonb not null default '{}'::jsonb,
+  content_hash text,
+  embedding public.vector(1536) not null,
+  image_url text
+);
+
+create table if not exists public.ingest_runs (
+  id uuid primary key default gen_random_uuid(),
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  model text not null,
+  source_name text not null,
+  total_chunks integer not null,
+  embedded_chunks integer not null default 0,
+  status text not null check (
+    status = any (array['running', 'success', 'error'])
+  ),
+  error_message text,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
 );
 
 create table if not exists public.ig_contacts (
@@ -290,6 +340,32 @@ create index if not exists audit_events_business_created_idx
 create index if not exists user_auth_events_user_created_idx
   on public.user_auth_events (user_id, created_at desc);
 
+create index if not exists knowledge_chunks_embedding_ivfflat_idx
+  on public.knowledge_chunks
+  using ivfflat (embedding vector_cosine_ops)
+  with (lists = 100);
+
+create index if not exists knowledge_chunks_instagram_account_idx
+  on public.knowledge_chunks (instagram_account_id);
+
+create index if not exists knowledge_chunks_instagram_account_created_at_idx
+  on public.knowledge_chunks (instagram_account_id, created_at desc);
+
+create index if not exists knowledge_chunks_source_url_idx
+  on public.knowledge_chunks (source_url);
+
+create index if not exists deleted_knowledge_chunks_instagram_account_deleted_at_idx
+  on public.deleted_knowledge_chunks (instagram_account_id, deleted_at desc);
+
+create index if not exists deleted_knowledge_chunks_original_chunk_id_idx
+  on public.deleted_knowledge_chunks (original_chunk_id);
+
+create index if not exists deleted_knowledge_chunks_deleted_by_idx
+  on public.deleted_knowledge_chunks (deleted_by);
+
+create index if not exists ingest_runs_instagram_account_created_at_idx
+  on public.ingest_runs (instagram_account_id, created_at desc);
+
 create index if not exists instagram_accounts_business_idx
   on public.instagram_accounts (business_id);
 
@@ -341,6 +417,41 @@ create index if not exists meta_webhook_events_business_created_idx
 create index if not exists meta_webhook_events_account_created_idx
   on public.meta_webhook_events (instagram_account_id, created_at desc);
 
+create or replace function public.match_knowledge_chunks(
+  p_instagram_account_id uuid,
+  p_query_embedding public.vector(1536),
+  p_match_count integer default 5
+)
+returns table (
+  id uuid,
+  text text,
+  type text,
+  source_url text,
+  page_path text,
+  title text,
+  meta_description text,
+  extra_metadata jsonb,
+  similarity double precision
+)
+language sql
+stable
+as $$
+  select
+    kc.id,
+    kc.text,
+    kc.type,
+    kc.source_url,
+    kc.page_path,
+    kc.title,
+    kc.meta_description,
+    kc.extra_metadata,
+    1 - (kc.embedding <=> p_query_embedding) as similarity
+  from public.knowledge_chunks kc
+  where kc.instagram_account_id = p_instagram_account_id
+  order by kc.embedding <=> p_query_embedding
+  limit greatest(coalesce(p_match_count, 5), 0)
+$$;
+
 create or replace view public.latest_ig_comment_classifications
 with (security_invoker = true)
 as
@@ -364,6 +475,10 @@ for each row execute function public.set_updated_at();
 
 create trigger set_business_subscriptions_updated_at
 before update on public.business_subscriptions
+for each row execute function public.set_updated_at();
+
+create trigger set_ingest_runs_updated_at
+before update on public.ingest_runs
 for each row execute function public.set_updated_at();
 
 create trigger set_instagram_accounts_updated_at
@@ -461,6 +576,9 @@ alter table public.businesses enable row level security;
 alter table public.business_users enable row level security;
 alter table public.audit_events enable row level security;
 alter table public.business_subscriptions enable row level security;
+alter table public.knowledge_chunks enable row level security;
+alter table public.deleted_knowledge_chunks enable row level security;
+alter table public.ingest_runs enable row level security;
 alter table public.user_auth_events enable row level security;
 alter table public.instagram_accounts enable row level security;
 alter table public.ig_contacts enable row level security;
@@ -479,6 +597,9 @@ grant select, insert, update, delete on public.businesses to authenticated;
 grant select, insert, update, delete on public.business_users to authenticated;
 grant select on public.audit_events to authenticated;
 grant select on public.business_subscriptions to authenticated;
+grant select on public.knowledge_chunks to authenticated;
+grant select on public.deleted_knowledge_chunks to authenticated;
+grant select on public.ingest_runs to authenticated;
 grant select on public.user_auth_events to authenticated;
 grant select, insert, update, delete on public.instagram_accounts to authenticated;
 grant select on public.ig_contacts to authenticated;
@@ -568,6 +689,42 @@ create policy "business subscriptions select members"
 on public.business_subscriptions for select
 to authenticated
 using (public.user_has_business_access(business_id));
+
+create policy "knowledge chunks select members"
+on public.knowledge_chunks for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = knowledge_chunks.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "deleted knowledge chunks select members"
+on public.deleted_knowledge_chunks for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = deleted_knowledge_chunks.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ingest runs select members"
+on public.ingest_runs for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ingest_runs.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
 
 create policy "user auth events select own"
 on public.user_auth_events for select
