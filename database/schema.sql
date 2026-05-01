@@ -302,6 +302,30 @@ create table if not exists public.ig_comments (
   unique (instagram_account_id, instagram_comment_id)
 );
 
+create table if not exists public.ig_promo_codes (
+  id uuid primary key default gen_random_uuid(),
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  post_id uuid not null references public.ig_posts(id) on delete cascade,
+  contact_id uuid not null references public.ig_contacts(id) on delete cascade,
+  comment_id uuid references public.ig_comments(id) on delete set null,
+  code text not null,
+  status text not null default 'issued' check (
+    status = any (array['issued', 'redeemed', 'void'])
+  ),
+  redeemed_at timestamp with time zone,
+  extra_metadata jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  foreign key (post_id, instagram_account_id)
+    references public.ig_posts(id, instagram_account_id)
+    on delete cascade,
+  foreign key (contact_id, instagram_account_id)
+    references public.ig_contacts(id, instagram_account_id)
+    on delete cascade,
+  constraint ig_promo_codes_post_contact_key unique (post_id, contact_id),
+  constraint ig_promo_codes_account_code_key unique (instagram_account_id, code)
+);
+
 create table if not exists public.ig_comment_classifications (
   id uuid primary key default gen_random_uuid(),
   comment_id uuid not null references public.ig_comments(id) on delete cascade,
@@ -405,6 +429,15 @@ create unique index if not exists ig_comments_one_automation_per_post_contact_id
       ]
     );
 
+create index if not exists ig_promo_codes_account_status_idx
+  on public.ig_promo_codes (instagram_account_id, status);
+
+create index if not exists ig_promo_codes_contact_created_idx
+  on public.ig_promo_codes (contact_id, created_at desc);
+
+create index if not exists ig_promo_codes_comment_idx
+  on public.ig_promo_codes (comment_id);
+
 create index if not exists ig_comment_classifications_comment_classified_idx
   on public.ig_comment_classifications (comment_id, classified_at desc);
 
@@ -505,6 +538,10 @@ create trigger set_ig_comments_updated_at
 before update on public.ig_comments
 for each row execute function public.set_updated_at();
 
+create trigger set_ig_promo_codes_updated_at
+before update on public.ig_promo_codes
+for each row execute function public.set_updated_at();
+
 create or replace function public.current_user_business_role(target_business_id uuid)
 returns text
 language sql
@@ -587,6 +624,7 @@ alter table public.ig_dm_messages enable row level security;
 alter table public.ig_dm_session_state enable row level security;
 alter table public.ig_posts enable row level security;
 alter table public.ig_comments enable row level security;
+alter table public.ig_promo_codes enable row level security;
 alter table public.ig_comment_classifications enable row level security;
 alter table public.meta_webhook_events enable row level security;
 
@@ -608,6 +646,7 @@ grant select on public.ig_dm_messages to authenticated;
 grant select on public.ig_dm_session_state to authenticated;
 grant select on public.ig_posts to authenticated;
 grant select on public.ig_comments to authenticated;
+grant select on public.ig_promo_codes to authenticated;
 grant select on public.ig_comment_classifications to authenticated;
 grant select on public.meta_webhook_events to authenticated;
 grant select on public.latest_ig_comment_classifications to authenticated;
@@ -822,6 +861,18 @@ using (
     select 1
     from public.instagram_accounts ia
     where ia.id = ig_comments.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ig promo codes select members"
+on public.ig_promo_codes for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ig_promo_codes.instagram_account_id
       and public.user_has_business_access(ia.business_id)
   )
 );
