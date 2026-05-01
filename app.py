@@ -12,6 +12,7 @@ from supabase_client import (
     SupabaseError,
     ensure_contact,
     ensure_dm_session,
+    ensure_promo_code,
     fetch_dm_history,
     get_comment_by_instagram_id,
     get_instagram_account,
@@ -206,12 +207,16 @@ def find_matched_keyword(comment_text, keywords):
     return None
 
 
-def build_comment_dm_input(post, comment_info, matched_keyword):
+def build_comment_dm_input(post, comment_info, matched_keyword, promo_code=None):
     campaign_prompt = post.get("dm_prompt") or ""
     caption = post.get("caption") or ""
-    content = "\n".join(
+    lines = [
+        "Generate a concise Instagram DM private reply for a user who commented on a promotional post.",
+    ]
+    if promo_code:
+        lines.append(f"Include this exact promo code in the DM and do not alter it: {promo_code}")
+    lines.extend(
         [
-            "Generate a concise Instagram DM private reply for a user who commented on a promotional post.",
             "",
             f"Post caption: {caption}",
             f"Campaign instructions: {campaign_prompt}",
@@ -219,7 +224,21 @@ def build_comment_dm_input(post, comment_info, matched_keyword):
             f"Comment text: {comment_info['comment_text']}",
         ]
     )
+    if promo_code:
+        lines.append(f"Promo code: {promo_code}")
+    content = "\n".join(lines)
     return [{"role": "user", "content": content}]
+
+
+def ensure_reply_contains_promo_code(reply_text, promo_code):
+    if not promo_code or promo_code in (reply_text or ""):
+        return reply_text
+
+    reply_text = (reply_text or "").strip()
+    suffix = f"Your code is {promo_code}."
+    if not reply_text:
+        return suffix
+    return f"{reply_text}\n\n{suffix}"
 
 
 def retrieve_knowledge_context(instagram_account_id, query_text):
@@ -577,6 +596,15 @@ def process_comment_with_database(comment_info, payload, event_type):
         automation_status="pending",
         matched_keyword=matched_keyword,
     )
+    promotion_metadata = post.get("promotion_metadata") or {}
+    code_prefix = promotion_metadata.get("code_prefix") if isinstance(promotion_metadata, dict) else None
+    promo_code = ensure_promo_code(
+        instagram_account["id"],
+        post["id"],
+        contact["id"],
+        comment["id"],
+        prefix=code_prefix,
+    )
     session = ensure_dm_session(instagram_account["id"], contact["id"])
     touch_dm_session(session["id"])
 
@@ -599,9 +627,13 @@ def process_comment_with_database(comment_info, payload, event_type):
     rag_result = retrieve_knowledge_context(instagram_account["id"], rag_query)
     started_at = time.perf_counter()
     openai_result = generate_reply(
-        build_comment_dm_input(post, comment_info, matched_keyword),
+        build_comment_dm_input(post, comment_info, matched_keyword, promo_code=promo_code["code"]),
         system_prompt=instagram_account.get("system_prompt"),
         knowledge_context=rag_result["chunks"],
+    )
+    openai_result["reply_text"] = ensure_reply_contains_promo_code(
+        openai_result["reply_text"],
+        promo_code["code"],
     )
     latency_ms = int((time.perf_counter() - started_at) * 1000)
     openai_error = openai_result.get("error") if openai_result["used_fallback"] else None
@@ -672,6 +704,8 @@ def process_comment_with_database(comment_info, payload, event_type):
             "contact_id": contact["id"],
             "session_id": session["id"],
             "assistant_message_id": assistant_message["id"] if assistant_message else None,
+            "promo_code_id": promo_code["id"],
+            "promo_code": promo_code["code"],
             "rag": {
                 "enabled": rag_result["enabled"],
                 "match_count": len(rag_result["chunks"]),

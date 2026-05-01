@@ -10,7 +10,7 @@ This is a Flask app for receiving Meta webhook requests on Render. It supports w
 
 For inbound text `dm-related` webhook events, the app looks up the connected Instagram account in Supabase, persists the contact/session/messages, retrieves relevant `knowledge_chunks` for that Instagram account, generates a reply with OpenAI from database-backed chat history plus RAG context, stores the assistant reply, and sends the reply back to the message sender.
 
-For `comment-related` webhook events, promotional posts can be configured with trigger keywords. When a matching comment arrives, the app stores the comment, sends a static public comment reply, retrieves relevant knowledge chunks, generates a private reply DM with OpenAI, and sends it using Meta's comment private-reply flow.
+For `comment-related` webhook events, promotional posts can be configured with trigger keywords. When a matching comment arrives, the app stores the comment, issues or reuses a unique promo code for that customer/post, sends a static public comment reply, retrieves relevant knowledge chunks, generates a private reply DM with OpenAI, and sends it using Meta's comment private-reply flow.
 
 ## Environment variables
 
@@ -90,11 +90,12 @@ set
   automation_enabled = true,
   trigger_keywords = '["DM", "Test"]'::jsonb,
   comment_reply_text = 'Check DMs',
-  dm_prompt = 'Send a friendly private reply about this promotion.'
+  dm_prompt = 'Send a friendly private reply about this promotion.',
+  promotion_metadata = '{"code_prefix": "KOSOO"}'::jsonb
 where instagram_media_id = 'YOUR_INSTAGRAM_MEDIA_ID';
 ```
 
-Automation is limited to one attempted DM per `post_id` and `contact_id`.
+Automation is limited to one attempted DM per `post_id` and `contact_id`. The app stores one readable promo code per customer/post in `ig_promo_codes` and includes that exact code in the private reply DM. If `promotion_metadata.code_prefix` is not set, codes use the `PROMO` prefix.
 
 ## Run locally
 

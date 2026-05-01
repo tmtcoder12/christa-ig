@@ -1,5 +1,8 @@
 import json
 import os
+import re
+import secrets
+import string
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -7,6 +10,9 @@ from datetime import datetime, timezone
 
 
 DEFAULT_TIMEOUT_SECONDS = 10
+PROMO_CODE_ALPHABET = string.ascii_uppercase + string.digits
+PROMO_CODE_SUFFIX_LENGTH = 6
+PROMO_CODE_MAX_ATTEMPTS = 8
 
 
 class SupabaseError(Exception):
@@ -147,6 +153,60 @@ def ensure_contact(instagram_account_id, sender_id, username=None):
         row["username"] = username
 
     return _upsert("ig_contacts", row, "instagram_account_id,instagram_user_id")
+
+
+def normalize_promo_code_prefix(prefix):
+    normalized = re.sub(r"[^A-Za-z0-9]", "", prefix or "").upper()
+    return (normalized or "PROMO")[:12]
+
+
+def generate_promo_code(prefix=None):
+    normalized_prefix = normalize_promo_code_prefix(prefix)
+    suffix = "".join(secrets.choice(PROMO_CODE_ALPHABET) for _ in range(PROMO_CODE_SUFFIX_LENGTH))
+    return f"{normalized_prefix}-{suffix}"
+
+
+def ensure_promo_code(instagram_account_id, post_id, contact_id, comment_id, prefix=None):
+    existing = _fetch_one(
+        "ig_promo_codes",
+        {
+            "post_id": f"eq.{post_id}",
+            "contact_id": f"eq.{contact_id}",
+            "select": "id,instagram_account_id,post_id,contact_id,comment_id,code,status,redeemed_at,extra_metadata",
+        },
+    )
+    if existing:
+        if comment_id and not existing.get("comment_id"):
+            _patch("ig_promo_codes", {"id": f"eq.{existing['id']}"}, {"comment_id": comment_id})
+            existing["comment_id"] = comment_id
+        return existing
+
+    for _ in range(PROMO_CODE_MAX_ATTEMPTS):
+        row = {
+            "instagram_account_id": instagram_account_id,
+            "post_id": post_id,
+            "contact_id": contact_id,
+            "comment_id": comment_id,
+            "code": generate_promo_code(prefix),
+            "status": "issued",
+        }
+        try:
+            return _insert("ig_promo_codes", row)
+        except SupabaseError as exc:
+            error_text = str(exc)
+            if "ig_promo_codes_post_contact_key" in error_text:
+                return _fetch_one(
+                    "ig_promo_codes",
+                    {
+                        "post_id": f"eq.{post_id}",
+                        "contact_id": f"eq.{contact_id}",
+                        "select": "id,instagram_account_id,post_id,contact_id,comment_id,code,status,redeemed_at,extra_metadata",
+                    },
+                )
+            if "ig_promo_codes_account_code_key" not in error_text:
+                raise
+
+    raise SupabaseError("Unable to generate a unique promo code after several attempts")
 
 
 def get_instagram_post(instagram_account_id, instagram_media_id):
