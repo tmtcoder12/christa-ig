@@ -250,15 +250,25 @@ create table if not exists public.ig_posts (
     post_type = any (array['regular', 'promotional'])
   ),
   automation_enabled boolean not null default false,
+  automation_starts_at timestamp with time zone,
+  automation_ends_at timestamp with time zone,
   trigger_keywords jsonb not null default '[]'::jsonb,
   comment_reply_text text not null default 'Sent you a DM!',
   dm_prompt text,
+  promo_code_valid_duration_hours integer check (
+    promo_code_valid_duration_hours is null or promo_code_valid_duration_hours > 0
+  ),
   promotion_metadata jsonb not null default '{}'::jsonb,
   like_count integer not null default 0 check (like_count >= 0),
   comment_count integer not null default 0 check (comment_count >= 0),
   extra_metadata jsonb not null default '{}'::jsonb,
   created_at timestamp with time zone not null default now(),
   updated_at timestamp with time zone not null default now(),
+  check (
+    automation_starts_at is null
+    or automation_ends_at is null
+    or automation_ends_at > automation_starts_at
+  ),
   unique (id, instagram_account_id),
   unique (instagram_account_id, instagram_media_id)
 );
@@ -312,10 +322,13 @@ create table if not exists public.ig_promo_codes (
   status text not null default 'issued' check (
     status = any (array['issued', 'redeemed', 'void'])
   ),
+  valid_from timestamp with time zone not null default now(),
+  expires_at timestamp with time zone,
   redeemed_at timestamp with time zone,
   extra_metadata jsonb not null default '{}'::jsonb,
   created_at timestamp with time zone not null default now(),
   updated_at timestamp with time zone not null default now(),
+  check (expires_at is null or expires_at > valid_from),
   foreign key (post_id, instagram_account_id)
     references public.ig_posts(id, instagram_account_id)
     on delete cascade,
@@ -409,6 +422,9 @@ create unique index if not exists ig_dm_messages_instagram_message_id_key
 create index if not exists ig_posts_account_posted_idx
   on public.ig_posts (instagram_account_id, posted_at desc);
 
+create index if not exists ig_posts_automation_window_idx
+  on public.ig_posts (instagram_account_id, automation_enabled, automation_starts_at, automation_ends_at);
+
 create index if not exists ig_comments_post_created_idx
   on public.ig_comments (post_id, created_at_ig desc);
 
@@ -437,6 +453,10 @@ create index if not exists ig_promo_codes_contact_created_idx
 
 create index if not exists ig_promo_codes_comment_idx
   on public.ig_promo_codes (comment_id);
+
+create index if not exists ig_promo_codes_expires_at_idx
+  on public.ig_promo_codes (expires_at)
+  where expires_at is not null;
 
 create index if not exists ig_comment_classifications_comment_classified_idx
   on public.ig_comment_classifications (comment_id, classified_at desc);

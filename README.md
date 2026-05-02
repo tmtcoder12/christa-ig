@@ -88,14 +88,32 @@ update public.ig_posts
 set
   post_type = 'promotional',
   automation_enabled = true,
+  automation_starts_at = now(),
+  automation_ends_at = now() + interval '7 days',
   trigger_keywords = '["DM", "Test"]'::jsonb,
   comment_reply_text = 'Check DMs',
   dm_prompt = 'Send a friendly private reply about this promotion.',
+  promo_code_valid_duration_hours = 48,
   promotion_metadata = '{"code_prefix": "KOSOO"}'::jsonb
 where instagram_media_id = 'YOUR_INSTAGRAM_MEDIA_ID';
 ```
 
-Automation is limited to one attempted DM per `post_id` and `contact_id`. The app stores one readable promo code per customer/post in `ig_promo_codes` and includes that exact code in the private reply DM. If `promotion_metadata.code_prefix` is not set, codes use the `PROMO` prefix.
+Automation is limited to one attempted DM per `post_id` and `contact_id`. The app only sends the public reply and private DM while the optional automation window is active:
+
+- `automation_starts_at = NULL` means the automation can start immediately.
+- `automation_ends_at = NULL` means the automation has no end date.
+- Both timestamps `NULL` means the promotional post behaves like an always-active automation as long as `automation_enabled = true`.
+- If `automation_starts_at` is in the future, comments are stored but no public reply, DM, or promo code is sent yet.
+- If `automation_ends_at` has passed, comments are stored but no public reply, DM, or promo code is sent.
+
+The app stores one readable promo code per customer/post in `ig_promo_codes` and includes that exact code in the private reply DM. If `promotion_metadata.code_prefix` is not set, codes use the `PROMO` prefix.
+
+Promo code validity is controlled by `promo_code_valid_duration_hours` on the post:
+
+- `promo_code_valid_duration_hours = NULL` means newly issued codes do not expire, so `ig_promo_codes.expires_at` stays `NULL`.
+- A positive value, such as `48`, means each newly issued code is valid for that many hours from the moment it is created.
+- Reused codes keep their original `valid_from` and `expires_at`; changing the post duration later does not rewrite already-issued codes.
+- Expiration is checked from `ig_promo_codes.expires_at`; the code status remains `issued` unless a future redemption/admin flow marks it `redeemed` or `void`.
 
 ## Run locally
 

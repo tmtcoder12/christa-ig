@@ -6,7 +6,7 @@ import string
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 
 DEFAULT_TIMEOUT_SECONDS = 10
@@ -166,13 +166,23 @@ def generate_promo_code(prefix=None):
     return f"{normalized_prefix}-{suffix}"
 
 
-def ensure_promo_code(instagram_account_id, post_id, contact_id, comment_id, prefix=None):
+def ensure_promo_code(
+    instagram_account_id,
+    post_id,
+    contact_id,
+    comment_id,
+    prefix=None,
+    valid_duration_hours=None,
+):
     existing = _fetch_one(
         "ig_promo_codes",
         {
             "post_id": f"eq.{post_id}",
             "contact_id": f"eq.{contact_id}",
-            "select": "id,instagram_account_id,post_id,contact_id,comment_id,code,status,redeemed_at,extra_metadata",
+            "select": (
+                "id,instagram_account_id,post_id,contact_id,comment_id,code,status,"
+                "valid_from,expires_at,redeemed_at,extra_metadata"
+            ),
         },
     )
     if existing:
@@ -182,6 +192,11 @@ def ensure_promo_code(instagram_account_id, post_id, contact_id, comment_id, pre
         return existing
 
     for _ in range(PROMO_CODE_MAX_ATTEMPTS):
+        valid_from = datetime.now(timezone.utc)
+        expires_at = None
+        if valid_duration_hours:
+            expires_at = valid_from + timedelta(hours=int(valid_duration_hours))
+
         row = {
             "instagram_account_id": instagram_account_id,
             "post_id": post_id,
@@ -189,7 +204,11 @@ def ensure_promo_code(instagram_account_id, post_id, contact_id, comment_id, pre
             "comment_id": comment_id,
             "code": generate_promo_code(prefix),
             "status": "issued",
+            "valid_from": valid_from.isoformat(),
         }
+        if expires_at:
+            row["expires_at"] = expires_at.isoformat()
+
         try:
             return _insert("ig_promo_codes", row)
         except SupabaseError as exc:
@@ -200,13 +219,32 @@ def ensure_promo_code(instagram_account_id, post_id, contact_id, comment_id, pre
                     {
                         "post_id": f"eq.{post_id}",
                         "contact_id": f"eq.{contact_id}",
-                        "select": "id,instagram_account_id,post_id,contact_id,comment_id,code,status,redeemed_at,extra_metadata",
+                        "select": (
+                            "id,instagram_account_id,post_id,contact_id,comment_id,code,status,"
+                            "valid_from,expires_at,redeemed_at,extra_metadata"
+                        ),
                     },
                 )
             if "ig_promo_codes_account_code_key" not in error_text:
                 raise
 
     raise SupabaseError("Unable to generate a unique promo code after several attempts")
+
+
+def is_promo_code_valid(code_row, now=None):
+    if not code_row or code_row.get("status") != "issued":
+        return False
+
+    expires_at = code_row.get("expires_at")
+    if not expires_at:
+        return True
+
+    now = now or datetime.now(timezone.utc)
+    if isinstance(expires_at, str):
+        expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    if expires_at.tzinfo is None:
+        expires_at = expires_at.replace(tzinfo=timezone.utc)
+    return now < expires_at
 
 
 def get_instagram_post(instagram_account_id, instagram_media_id):
@@ -217,8 +255,9 @@ def get_instagram_post(instagram_account_id, instagram_media_id):
             "instagram_media_id": f"eq.{instagram_media_id}",
             "select": (
                 "id,instagram_account_id,instagram_media_id,caption,post_type,"
-                "automation_enabled,trigger_keywords,comment_reply_text,dm_prompt,"
-                "promotion_metadata"
+                "automation_enabled,automation_starts_at,automation_ends_at,"
+                "trigger_keywords,comment_reply_text,dm_prompt,"
+                "promo_code_valid_duration_hours,promotion_metadata"
             ),
         },
     )

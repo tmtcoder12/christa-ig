@@ -241,6 +241,33 @@ def ensure_reply_contains_promo_code(reply_text, promo_code):
     return f"{reply_text}\n\n{suffix}"
 
 
+def parse_db_timestamp(value):
+    if not value:
+        return None
+    try:
+        if isinstance(value, datetime):
+            timestamp = value
+        else:
+            timestamp = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except (TypeError, ValueError):
+        logger.warning("Ignoring invalid database timestamp: %s", value)
+        return None
+    if timestamp.tzinfo is None:
+        return timestamp.replace(tzinfo=timezone.utc)
+    return timestamp
+
+
+def is_post_automation_active(post, now=None):
+    now = now or datetime.now(timezone.utc)
+    starts_at = parse_db_timestamp(post.get("automation_starts_at"))
+    ends_at = parse_db_timestamp(post.get("automation_ends_at"))
+    if starts_at and now < starts_at:
+        return False
+    if ends_at and now >= ends_at:
+        return False
+    return True
+
+
 def retrieve_knowledge_context(instagram_account_id, query_text):
     if not parse_bool_env("RAG_ENABLED", True):
         return {"chunks": [], "error": None, "enabled": False}
@@ -555,6 +582,23 @@ def process_comment_with_database(comment_info, payload, event_type):
             },
         }
 
+    if not is_post_automation_active(post):
+        comment = upsert_comment(**base_comment_kwargs)
+        processing_result = log_comment_event("comment_automation_window_inactive")
+        return {
+            "processing_result": processing_result,
+            "openai_result": None,
+            "public_reply_response": None,
+            "private_reply_response": None,
+            "db_result": {
+                "instagram_account_id": instagram_account["id"],
+                "post_id": post["id"],
+                "comment_id": comment["id"] if comment else None,
+                "automation_starts_at": post.get("automation_starts_at"),
+                "automation_ends_at": post.get("automation_ends_at"),
+            },
+        }
+
     matched_keyword = find_matched_keyword(comment_text, post.get("trigger_keywords"))
     if not matched_keyword:
         comment = upsert_comment(**base_comment_kwargs)
@@ -604,6 +648,7 @@ def process_comment_with_database(comment_info, payload, event_type):
         contact["id"],
         comment["id"],
         prefix=code_prefix,
+        valid_duration_hours=post.get("promo_code_valid_duration_hours"),
     )
     session = ensure_dm_session(instagram_account["id"], contact["id"])
     touch_dm_session(session["id"])
@@ -706,6 +751,8 @@ def process_comment_with_database(comment_info, payload, event_type):
             "assistant_message_id": assistant_message["id"] if assistant_message else None,
             "promo_code_id": promo_code["id"],
             "promo_code": promo_code["code"],
+            "promo_code_valid_from": promo_code.get("valid_from"),
+            "promo_code_expires_at": promo_code.get("expires_at"),
             "rag": {
                 "enabled": rag_result["enabled"],
                 "match_count": len(rag_result["chunks"]),
