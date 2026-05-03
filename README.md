@@ -113,7 +113,8 @@ Promo code validity is controlled by `promo_code_valid_duration_hours` on the po
 - `promo_code_valid_duration_hours = NULL` means newly issued codes do not expire, so `ig_promo_codes.expires_at` stays `NULL`.
 - A positive value, such as `48`, means each newly issued code is valid for that many hours from the moment it is created.
 - Reused codes keep their original `valid_from` and `expires_at`; changing the post duration later does not rewrite already-issued codes.
-- Expiration is checked from `ig_promo_codes.expires_at`; the code status remains `issued` unless a future redemption/admin flow marks it `redeemed` or `void`.
+- Expiration is checked from `ig_promo_codes.expires_at`; when webhook traffic is processed, issued codes with `expires_at < now()` are marked `expired`.
+- `status = 'expired'` means the validity window has passed; `redeemed` means the code was used; `void` means an admin/manual flow invalidated it.
 
 ## Run locally
 

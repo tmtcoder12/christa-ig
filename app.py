@@ -12,6 +12,7 @@ from supabase_client import (
     SupabaseError,
     ensure_contact,
     ensure_dm_session,
+    expire_expired_promo_codes,
     ensure_promo_code,
     fetch_dm_history,
     get_comment_by_instagram_id,
@@ -873,6 +874,13 @@ def webhook():
     public_reply_response = None
     private_reply_response = None
     db_result = None
+    expired_promo_codes = []
+
+    if is_supabase_configured() and event_type in {"dm-related", "comment-related"}:
+        try:
+            expired_promo_codes = expire_expired_promo_codes()
+        except SupabaseError:
+            logger.exception("Failed to expire stale promo codes")
 
     if event_type == "dm-related":
         dm_info = get_dm_processing_info(payload)
@@ -949,6 +957,12 @@ def webhook():
 
     if db_result is not None:
         log_entry["db_result"] = db_result
+
+    if expired_promo_codes:
+        log_entry["expired_promo_codes"] = {
+            "count": len(expired_promo_codes),
+            "codes": expired_promo_codes,
+        }
 
     logger.info("Webhook received:\n%s", json.dumps(log_entry, indent=2, default=str))
 

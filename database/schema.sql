@@ -320,7 +320,7 @@ create table if not exists public.ig_promo_codes (
   comment_id uuid references public.ig_comments(id) on delete set null,
   code text not null,
   status text not null default 'issued' check (
-    status = any (array['issued', 'redeemed', 'void'])
+    status = any (array['issued', 'redeemed', 'expired', 'void'])
   ),
   valid_from timestamp with time zone not null default now(),
   expires_at timestamp with time zone,

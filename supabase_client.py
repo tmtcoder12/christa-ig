@@ -114,6 +114,10 @@ def _patch(table, filters, patch):
     return _request("PATCH", table, params=filters, payload=patch, prefer="return=minimal")
 
 
+def _patch_returning(table, filters, patch):
+    return _request("PATCH", table, params=filters, payload=patch, prefer="return=representation") or []
+
+
 def _rpc(function_name, payload):
     return _request("POST", f"rpc/{function_name}", payload=payload)
 
@@ -245,6 +249,19 @@ def is_promo_code_valid(code_row, now=None):
     if expires_at.tzinfo is None:
         expires_at = expires_at.replace(tzinfo=timezone.utc)
     return now < expires_at
+
+
+def expire_expired_promo_codes(now=None):
+    now = now or datetime.now(timezone.utc)
+    return _patch_returning(
+        "ig_promo_codes",
+        {
+            "status": "eq.issued",
+            "expires_at": f"lt.{now.isoformat()}",
+            "select": "id,code,instagram_account_id,post_id,contact_id,expires_at,status",
+        },
+        {"status": "expired"},
+    )
 
 
 def get_instagram_post(instagram_account_id, instagram_media_id):
