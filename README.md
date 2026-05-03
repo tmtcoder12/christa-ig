@@ -1,6 +1,12 @@
-# Python Meta Webhook for Render
+# Christa IG Monorepo
 
-This is a Flask app for receiving Meta webhook requests on Render. It supports webhook verification, replies to inbound Instagram DMs with OpenAI-generated text, can trigger comment-to-DM automations on promotional posts, and can use Supabase `pgvector` knowledge chunks as RAG context.
+This repo is organized as a small monorepo:
+
+- `backend/` contains the Flask webhook/API service, Supabase schema, and backend Python dependencies.
+- `frontend-login/` contains the Vite React UI for authenticated business users.
+- `embeddings/` contains the CLI flow for embedding JSONL knowledge chunks and upserting them into Supabase.
+
+The backend Flask app receives Meta webhook requests on Render. It supports webhook verification, replies to inbound Instagram DMs with OpenAI-generated text, can trigger comment-to-DM automations on promotional posts, and can use Supabase `pgvector` knowledge chunks as RAG context.
 
 ## Endpoints
 
@@ -18,6 +24,8 @@ For `comment-related` webhook events, promotional posts can be configured with t
 - `INSTAGRAM_ACCESS_TOKEN` is the access token used to send Instagram DM replies through the Meta Graph API.
 - `SUPABASE_URL` is your Supabase project URL.
 - `SUPABASE_SERVICE_ROLE_KEY` is used by the backend webhook to insert and update tenant data. Keep this server-side only.
+- `SUPABASE_ANON_KEY` is used by backend API routes to verify Supabase Auth bearer tokens from the frontend.
+- `FRONTEND_ORIGIN` optionally allows a deployed frontend origin for backend API CORS. Local dev allows `http://127.0.0.1:5173` and `http://localhost:5173` by default.
 - `OPENAI_API_KEY` is used to authenticate with OpenAI.
 - `OPENAI_MODEL` optionally overrides the default OpenAI model.
 - `OPENAI_EMBEDDING_MODEL` optionally overrides the embedding model used for RAG queries. Defaults to `text-embedding-3-small`.
@@ -27,9 +35,17 @@ For `comment-related` webhook events, promotional posts can be configured with t
 - `RAG_MATCH_COUNT` optionally sets how many knowledge chunks are sent to OpenAI. Defaults to `5`.
 - `PORT` is provided by Render automatically.
 
+The `frontend-login` Vite app also uses browser-safe frontend env vars:
+
+```env
+VITE_SUPABASE_URL=https://your-project.supabase.co
+VITE_SUPABASE_ANON_KEY=your-public-anon-key
+VITE_BACKEND_URL=http://127.0.0.1:5000
+```
+
 ## Supabase setup
 
-Run the schema in `database/schema.sql` in your Supabase SQL editor or with `psql`. The schema enables `pgcrypto` and `vector`, creates the Instagram/DM/comment tables, creates `knowledge_chunks`, and defines the `match_knowledge_chunks(...)` RPC used by RAG.
+Run the schema in `backend/database/schema.sql` in your Supabase SQL editor or with `psql`. The schema enables `pgcrypto` and `vector`, creates the Instagram/DM/comment tables, creates `knowledge_chunks`, and defines the `match_knowledge_chunks(...)` RPC used by RAG.
 
 Before the webhook can persist a DM, the receiving Instagram account must exist in `instagram_accounts`. In Meta DM webhooks, `entry.id` is your business Instagram account ID and `messaging[].sender.id` is the contact. For example, with this payload:
 
@@ -74,6 +90,7 @@ INGEST_TRACK_RUNS=true
 Then run:
 
 ```bash
+python3 -m pip install -r embeddings/requirements.txt
 python3 embeddings/embed-to-db.py embeddings/businessData/kosoo-chunks.jsonl 32
 ```
 
@@ -116,11 +133,13 @@ Promo code validity is controlled by `promo_code_valid_duration_hours` on the po
 - Expiration is checked from `ig_promo_codes.expires_at`; when webhook traffic is processed, issued codes with `expires_at < now()` are marked `expired`.
 - `status = 'expired'` means the validity window has passed; `redeemed` means the code was used; `void` means an admin/manual flow invalidated it.
 
+The `frontend-login` Add Promotion page creates a pending `ig_promotion_setups` row through `POST /api/promotions`. The backend snapshots the selected account's existing `ig_posts.instagram_media_id` values, polls Instagram media every 30 seconds for up to 5 minutes, and turns the newest unseen media item into a promotional `ig_posts` row. Only one pending/polling setup can exist per Instagram account.
+
 ## Run locally
 
 ```bash
-pip install -r requirements.txt
-python app.py
+pip install -r backend/requirements.txt
+python backend/app.py
 ```
 
 Then send a test request:

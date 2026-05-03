@@ -273,6 +273,41 @@ create table if not exists public.ig_posts (
   unique (instagram_account_id, instagram_media_id)
 );
 
+create table if not exists public.ig_promotion_setups (
+  id uuid primary key default gen_random_uuid(),
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  submitted_by uuid not null references public.profiles(id) on delete restrict,
+  trigger_keywords jsonb not null default '[]'::jsonb,
+  automation_starts_at timestamp with time zone,
+  automation_ends_at timestamp with time zone,
+  promo_code_valid_duration_hours integer check (
+    promo_code_valid_duration_hours is null or promo_code_valid_duration_hours > 0
+  ),
+  comment_reply_text text not null default 'Sent you a DM!',
+  dm_prompt text,
+  code_prefix text,
+  baseline_media_ids jsonb not null default '[]'::jsonb,
+  status text not null default 'pending' check (
+    status = any (array['pending', 'polling', 'found', 'expired', 'error'])
+  ),
+  post_id uuid references public.ig_posts(id) on delete set null,
+  found_instagram_media_id text,
+  found_caption text,
+  error_message text,
+  poll_started_at timestamp with time zone,
+  poll_expires_at timestamp with time zone,
+  last_polled_at timestamp with time zone,
+  found_at timestamp with time zone,
+  extra_metadata jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  check (
+    automation_starts_at is null
+    or automation_ends_at is null
+    or automation_ends_at > automation_starts_at
+  )
+);
+
 create table if not exists public.ig_comments (
   id uuid primary key default gen_random_uuid(),
   instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
@@ -425,6 +460,16 @@ create index if not exists ig_posts_account_posted_idx
 create index if not exists ig_posts_automation_window_idx
   on public.ig_posts (instagram_account_id, automation_enabled, automation_starts_at, automation_ends_at);
 
+create index if not exists ig_promotion_setups_account_created_idx
+  on public.ig_promotion_setups (instagram_account_id, created_at desc);
+
+create index if not exists ig_promotion_setups_submitted_by_created_idx
+  on public.ig_promotion_setups (submitted_by, created_at desc);
+
+create unique index if not exists ig_promotion_setups_one_active_per_account_idx
+  on public.ig_promotion_setups (instagram_account_id)
+  where status = any (array['pending', 'polling']);
+
 create index if not exists ig_comments_post_created_idx
   on public.ig_comments (post_id, created_at_ig desc);
 
@@ -554,6 +599,10 @@ create trigger set_ig_posts_updated_at
 before update on public.ig_posts
 for each row execute function public.set_updated_at();
 
+create trigger set_ig_promotion_setups_updated_at
+before update on public.ig_promotion_setups
+for each row execute function public.set_updated_at();
+
 create trigger set_ig_comments_updated_at
 before update on public.ig_comments
 for each row execute function public.set_updated_at();
@@ -643,6 +692,7 @@ alter table public.ig_dm_sessions enable row level security;
 alter table public.ig_dm_messages enable row level security;
 alter table public.ig_dm_session_state enable row level security;
 alter table public.ig_posts enable row level security;
+alter table public.ig_promotion_setups enable row level security;
 alter table public.ig_comments enable row level security;
 alter table public.ig_promo_codes enable row level security;
 alter table public.ig_comment_classifications enable row level security;
@@ -658,13 +708,14 @@ grant select on public.business_subscriptions to authenticated;
 grant select on public.knowledge_chunks to authenticated;
 grant select on public.deleted_knowledge_chunks to authenticated;
 grant select on public.ingest_runs to authenticated;
-grant select on public.user_auth_events to authenticated;
+grant select, insert on public.user_auth_events to authenticated;
 grant select, insert, update, delete on public.instagram_accounts to authenticated;
 grant select on public.ig_contacts to authenticated;
 grant select on public.ig_dm_sessions to authenticated;
 grant select on public.ig_dm_messages to authenticated;
 grant select on public.ig_dm_session_state to authenticated;
 grant select on public.ig_posts to authenticated;
+grant select on public.ig_promotion_setups to authenticated;
 grant select on public.ig_comments to authenticated;
 grant select on public.ig_promo_codes to authenticated;
 grant select on public.ig_comment_classifications to authenticated;
@@ -790,6 +841,11 @@ on public.user_auth_events for select
 to authenticated
 using (user_id = auth.uid());
 
+create policy "user auth events insert own"
+on public.user_auth_events for insert
+to authenticated
+with check (user_id = auth.uid());
+
 create policy "instagram accounts select members"
 on public.instagram_accounts for select
 to authenticated
@@ -869,6 +925,18 @@ using (
     select 1
     from public.instagram_accounts ia
     where ia.id = ig_posts.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ig promotion setups select members"
+on public.ig_promotion_setups for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ig_promotion_setups.instagram_account_id
       and public.user_has_business_access(ia.business_id)
   )
 );

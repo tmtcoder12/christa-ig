@@ -2,5 +2,16 @@ __pycache__
 .venv
 api-info.txt
 myenv
-embeddings
 .env
+backend/__pycache__
+backend/.env
+embeddings/__pycache__
+embeddings/.env
+embeddings/businessData
+frontend-login/.env.example
+frontend-login/.env.local
+frontend-login/dist
+frontend-login/node_modules
+frontend-login/*.tsbuildinfo
+frontend-login/vite.config.d.ts
+frontend-login/vite.config.js

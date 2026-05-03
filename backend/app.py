@@ -1,15 +1,18 @@
 import json
 import logging
 import os
+import threading
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request
 from openai_client import generate_query_embedding, generate_reply
 from supabase_client import (
     SupabaseError,
+    create_promotion_setup,
     ensure_contact,
     ensure_dm_session,
     expire_expired_promo_codes,
@@ -17,18 +20,24 @@ from supabase_client import (
     fetch_dm_history,
     get_comment_by_instagram_id,
     get_instagram_account,
+    get_instagram_account_by_id,
     get_instagram_post,
+    get_promotion_setup,
     has_prior_comment_automation,
     insert_dm_message,
     is_configured as is_supabase_configured,
     iso_from_meta_timestamp,
+    list_instagram_post_media_ids,
     match_knowledge_chunks,
     message_exists,
     touch_dm_session,
     update_comment_automation,
+    update_promotion_setup,
+    upsert_instagram_post,
     upsert_comment,
     upsert_dm_session_state,
     upsert_meta_webhook_event,
+    user_has_instagram_account_access,
 )
 
 
@@ -37,7 +46,32 @@ logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 INSTAGRAM_SEND_MESSAGE_URL = "https://graph.instagram.com/v24.0/me/messages"
 INSTAGRAM_COMMENT_REPLIES_URL = "https://graph.instagram.com/v24.0/{comment_id}/replies"
+INSTAGRAM_MEDIA_URL = "https://graph.instagram.com/v24.0/{instagram_user_id}/media"
+PROMOTION_POLL_INTERVAL_SECONDS = 30
+PROMOTION_POLL_TIMEOUT_SECONDS = 5 * 60
 conversation_history = {}
+
+
+def get_allowed_frontend_origins():
+    configured_origin = os.environ.get("FRONTEND_ORIGIN")
+    origins = {"http://127.0.0.1:5173", "http://localhost:5173"}
+    if configured_origin:
+        origins.add(configured_origin.rstrip("/"))
+    return origins
+
+
+@app.after_request
+def add_api_cors_headers(response):
+    if not request.path.startswith("/api/"):
+        return response
+
+    origin = request.headers.get("Origin")
+    if origin and origin.rstrip("/") in get_allowed_frontend_origins():
+        response.headers["Access-Control-Allow-Origin"] = origin
+        response.headers["Vary"] = "Origin"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    return response
 
 
 def parse_bool_env(name, default):
@@ -287,6 +321,276 @@ def retrieve_knowledge_context(instagram_account_id, query_text):
     except Exception as exc:  # noqa: BLE001 - retrieval should not block replies.
         logger.warning("RAG retrieval failed for Instagram account %s: %s", instagram_account_id, exc)
         return {"chunks": [], "error": str(exc), "enabled": True}
+
+
+def api_error(message, status=400, **extra):
+    return jsonify({"error": message, **extra}), status
+
+
+def get_api_bearer_token():
+    authorization = request.headers.get("Authorization", "")
+    if not authorization.startswith("Bearer "):
+        return None
+    token = authorization.removeprefix("Bearer ").strip()
+    return token or None
+
+
+def verify_supabase_user_token(token):
+    supabase_url = os.environ.get("SUPABASE_URL", "").rstrip("/")
+    anon_key = os.environ.get("SUPABASE_ANON_KEY")
+    if not supabase_url or not anon_key:
+        raise SupabaseError("SUPABASE_URL and SUPABASE_ANON_KEY must be set for API auth")
+
+    api_request = urllib.request.Request(
+        f"{supabase_url}/auth/v1/user",
+        headers={
+            "apikey": anon_key,
+            "Authorization": f"Bearer {token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(api_request, timeout=10) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        logger.warning("Supabase auth verification failed: %s %s", exc.code, error_body)
+        return None
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise SupabaseError(f"Supabase auth verification failed: {exc}") from exc
+
+
+def get_authenticated_api_user():
+    token = get_api_bearer_token()
+    if not token:
+        return None
+    return verify_supabase_user_token(token)
+
+
+def parse_api_timestamp(value, field_name):
+    if value in (None, ""):
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ValueError(f"{field_name} must be an ISO timestamp") from exc
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.isoformat()
+
+
+def validate_promotion_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be a JSON object")
+
+    instagram_account_id = str(payload.get("instagram_account_id") or "").strip()
+    if not instagram_account_id:
+        raise ValueError("instagram_account_id is required")
+
+    raw_keywords = payload.get("trigger_keywords")
+    if not isinstance(raw_keywords, list):
+        raise ValueError("trigger_keywords must be an array")
+
+    trigger_keywords = []
+    for keyword in raw_keywords:
+        if not isinstance(keyword, str):
+            continue
+        stripped = keyword.strip()
+        if stripped and stripped not in trigger_keywords:
+            trigger_keywords.append(stripped)
+    if not trigger_keywords:
+        raise ValueError("At least one trigger keyword is required")
+
+    comment_reply_text = str(payload.get("comment_reply_text") or "").strip()
+    if not comment_reply_text:
+        raise ValueError("comment_reply_text is required")
+
+    automation_starts_at = parse_api_timestamp(payload.get("automation_starts_at"), "automation_starts_at")
+    automation_ends_at = parse_api_timestamp(payload.get("automation_ends_at"), "automation_ends_at")
+    if automation_starts_at and automation_ends_at:
+        starts_at = datetime.fromisoformat(automation_starts_at)
+        ends_at = datetime.fromisoformat(automation_ends_at)
+        if ends_at <= starts_at:
+            raise ValueError("automation_ends_at must be after automation_starts_at")
+
+    duration = payload.get("promo_code_valid_duration_hours")
+    if duration in (None, ""):
+        promo_code_valid_duration_hours = None
+    else:
+        try:
+            promo_code_valid_duration_hours = int(duration)
+        except (TypeError, ValueError) as exc:
+            raise ValueError("promo_code_valid_duration_hours must be a positive integer") from exc
+        if promo_code_valid_duration_hours <= 0:
+            raise ValueError("promo_code_valid_duration_hours must be a positive integer")
+
+    return {
+        "instagram_account_id": instagram_account_id,
+        "trigger_keywords": trigger_keywords,
+        "automation_starts_at": automation_starts_at,
+        "automation_ends_at": automation_ends_at,
+        "promo_code_valid_duration_hours": promo_code_valid_duration_hours,
+        "comment_reply_text": comment_reply_text,
+        "dm_prompt": str(payload.get("dm_prompt") or "").strip() or None,
+        "code_prefix": str(payload.get("code_prefix") or "").strip() or None,
+    }
+
+
+def fetch_instagram_media(instagram_user_id):
+    access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+    if not access_token:
+        raise RuntimeError("INSTAGRAM_ACCESS_TOKEN is not set")
+
+    query = urllib.parse.urlencode(
+        {
+            "fields": "id,caption,media_type,media_url,permalink,timestamp",
+            "limit": "25",
+        }
+    )
+    api_request = urllib.request.Request(
+        f"{INSTAGRAM_MEDIA_URL.format(instagram_user_id=instagram_user_id)}?{query}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(api_request, timeout=10) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Instagram media fetch failed: {exc.code} {error_body}") from exc
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Instagram media fetch failed: {exc}") from exc
+
+    media = payload.get("data")
+    return media if isinstance(media, list) else []
+
+
+def parse_meta_media_timestamp(value):
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def newest_unseen_media(media_items, baseline_media_ids):
+    baseline = set(baseline_media_ids or [])
+    candidates = [
+        item
+        for item in media_items
+        if isinstance(item, dict) and item.get("id") and item["id"] not in baseline
+    ]
+    candidates.sort(
+        key=lambda item: parse_meta_media_timestamp(item.get("timestamp")) or datetime.min.replace(tzinfo=timezone.utc),
+        reverse=True,
+    )
+    return candidates[0] if candidates else None
+
+
+def build_promotional_post_row(setup, media_item):
+    timestamp = parse_meta_media_timestamp(media_item.get("timestamp"))
+    promotion_metadata = {}
+    if setup.get("code_prefix"):
+        promotion_metadata["code_prefix"] = setup["code_prefix"]
+
+    return {
+        "instagram_account_id": setup["instagram_account_id"],
+        "instagram_media_id": media_item["id"],
+        "caption": media_item.get("caption"),
+        "media_type": media_item.get("media_type"),
+        "media_url": media_item.get("media_url"),
+        "permalink": media_item.get("permalink"),
+        "posted_at": timestamp.isoformat() if timestamp else None,
+        "post_type": "promotional",
+        "automation_enabled": True,
+        "automation_starts_at": setup.get("automation_starts_at"),
+        "automation_ends_at": setup.get("automation_ends_at"),
+        "trigger_keywords": setup.get("trigger_keywords") or [],
+        "comment_reply_text": setup.get("comment_reply_text") or "Sent you a DM!",
+        "dm_prompt": setup.get("dm_prompt"),
+        "promo_code_valid_duration_hours": setup.get("promo_code_valid_duration_hours"),
+        "promotion_metadata": promotion_metadata,
+        "extra_metadata": {
+            "promotion_setup_id": setup["id"],
+            "source": "promotion_setup_poll",
+            "meta_media": media_item,
+        },
+    }
+
+
+def run_promotion_setup_poll(setup_id):
+    try:
+        setup = get_promotion_setup(setup_id)
+        if not setup or setup.get("status") not in {"pending", "polling"}:
+            return
+
+        account = get_instagram_account_by_id(setup["instagram_account_id"])
+        if not account:
+            update_promotion_setup(setup_id, {"status": "error", "error_message": "Instagram account not found"})
+            return
+
+        started_at = datetime.now(timezone.utc)
+        expires_at = started_at + timedelta(seconds=PROMOTION_POLL_TIMEOUT_SECONDS)
+        setup = update_promotion_setup(
+            setup_id,
+            {
+                "status": "polling",
+                "poll_started_at": started_at.isoformat(),
+                "poll_expires_at": expires_at.isoformat(),
+            },
+        ) or setup
+
+        baseline_media_ids = setup.get("baseline_media_ids") or []
+        while datetime.now(timezone.utc) <= expires_at:
+            update_promotion_setup(setup_id, {"last_polled_at": datetime.now(timezone.utc).isoformat()})
+            media_item = newest_unseen_media(fetch_instagram_media(account["instagram_user_id"]), baseline_media_ids)
+
+            if media_item:
+                post = upsert_instagram_post(build_promotional_post_row(setup, media_item))
+                update_promotion_setup(
+                    setup_id,
+                    {
+                        "status": "found",
+                        "post_id": post["id"] if post else None,
+                        "found_instagram_media_id": media_item["id"],
+                        "found_caption": media_item.get("caption"),
+                        "found_at": datetime.now(timezone.utc).isoformat(),
+                        "extra_metadata": {
+                            **(setup.get("extra_metadata") or {}),
+                            "found_media": media_item,
+                        },
+                    },
+                )
+                return
+
+            time.sleep(PROMOTION_POLL_INTERVAL_SECONDS)
+
+        update_promotion_setup(
+            setup_id,
+            {
+                "status": "expired",
+                "error_message": "No new Instagram media found within the 5 minute polling window",
+            },
+        )
+    except Exception as exc:
+        logger.exception("Promotion setup polling failed for setup %s", setup_id)
+        try:
+            update_promotion_setup(setup_id, {"status": "error", "error_message": str(exc)})
+        except Exception:
+            logger.exception("Failed to mark promotion setup %s as errored", setup_id)
+
+
+def start_promotion_setup_poll(setup_id):
+    thread = threading.Thread(target=run_promotion_setup_poll, args=(setup_id,), daemon=True)
+    thread.start()
 
 
 def get_user_history(sender_id):
@@ -861,6 +1165,103 @@ def verify_webhook():
         bool(expected_token),
     )
     return "Forbidden", 403
+
+
+@app.route("/api/promotions", methods=["OPTIONS"])
+@app.route("/api/promotions/<setup_id>", methods=["OPTIONS"])
+def promotion_api_options(setup_id=None):
+    return "", 204
+
+
+@app.post("/api/promotions")
+def create_promotion():
+    if not is_supabase_configured():
+        return api_error("Supabase is not configured", 500)
+
+    try:
+        user = get_authenticated_api_user()
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    if not user or not user.get("id"):
+        return api_error("Unauthorized", 401)
+
+    try:
+        promotion_input = validate_promotion_payload(request.get_json(silent=True))
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+    try:
+        account = user_has_instagram_account_access(user["id"], promotion_input["instagram_account_id"])
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+    if not account:
+        return api_error("You do not have access to this Instagram account", 403)
+
+    try:
+        baseline_media_ids = list_instagram_post_media_ids(account["id"])
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+    now = datetime.now(timezone.utc)
+    setup_row = {
+        "instagram_account_id": account["id"],
+        "submitted_by": user["id"],
+        "trigger_keywords": promotion_input["trigger_keywords"],
+        "automation_starts_at": promotion_input["automation_starts_at"],
+        "automation_ends_at": promotion_input["automation_ends_at"],
+        "promo_code_valid_duration_hours": promotion_input["promo_code_valid_duration_hours"],
+        "comment_reply_text": promotion_input["comment_reply_text"],
+        "dm_prompt": promotion_input["dm_prompt"],
+        "code_prefix": promotion_input["code_prefix"],
+        "baseline_media_ids": baseline_media_ids,
+        "status": "pending",
+        "poll_expires_at": (now + timedelta(seconds=PROMOTION_POLL_TIMEOUT_SECONDS)).isoformat(),
+        "extra_metadata": {
+            "baseline_count": len(baseline_media_ids),
+            "submitted_from": "frontend-login",
+        },
+    }
+
+    try:
+        setup = create_promotion_setup(setup_row)
+    except SupabaseError as exc:
+        error_text = str(exc)
+        if "ig_promotion_setups_one_active_per_account_idx" in error_text or "duplicate key" in error_text:
+            return api_error("An active promotion setup is already polling for this Instagram account", 409)
+        return api_error(error_text, 500)
+
+    start_promotion_setup_poll(setup["id"])
+    return jsonify({"setup": setup}), 202
+
+
+@app.get("/api/promotions/<setup_id>")
+def get_promotion(setup_id):
+    if not is_supabase_configured():
+        return api_error("Supabase is not configured", 500)
+
+    try:
+        user = get_authenticated_api_user()
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    if not user or not user.get("id"):
+        return api_error("Unauthorized", 401)
+
+    try:
+        setup = get_promotion_setup(setup_id)
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+    if not setup:
+        return api_error("Promotion setup not found", 404)
+
+    try:
+        has_access = user_has_instagram_account_access(user["id"], setup["instagram_account_id"])
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+    if not has_access:
+        return api_error("You do not have access to this promotion setup", 403)
+
+    return jsonify({"setup": setup})
 
 
 @app.post("/webhook")

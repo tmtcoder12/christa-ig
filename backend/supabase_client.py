@@ -13,6 +13,13 @@ DEFAULT_TIMEOUT_SECONDS = 10
 PROMO_CODE_ALPHABET = string.ascii_uppercase + string.digits
 PROMO_CODE_SUFFIX_LENGTH = 6
 PROMO_CODE_MAX_ATTEMPTS = 8
+PROMOTION_SETUP_SELECT = (
+    "id,instagram_account_id,submitted_by,trigger_keywords,automation_starts_at,"
+    "automation_ends_at,promo_code_valid_duration_hours,comment_reply_text,dm_prompt,"
+    "code_prefix,baseline_media_ids,status,post_id,found_instagram_media_id,"
+    "found_caption,error_message,poll_started_at,poll_expires_at,last_polled_at,"
+    "found_at,extra_metadata,created_at,updated_at"
+)
 
 
 class SupabaseError(Exception):
@@ -130,6 +137,32 @@ def get_instagram_account(instagram_user_id):
             "select": "id,business_id,instagram_user_id,username,status,system_prompt",
         },
     )
+
+
+def get_instagram_account_by_id(instagram_account_id):
+    return _fetch_one(
+        "instagram_accounts",
+        {
+            "id": f"eq.{instagram_account_id}",
+            "select": "id,business_id,instagram_user_id,username,status",
+        },
+    )
+
+
+def user_has_instagram_account_access(user_id, instagram_account_id):
+    account = get_instagram_account_by_id(instagram_account_id)
+    if not account:
+        return None
+
+    membership = _fetch_one(
+        "business_users",
+        {
+            "business_id": f"eq.{account['business_id']}",
+            "user_id": f"eq.{user_id}",
+            "select": "id,role",
+        },
+    )
+    return account if membership else None
 
 
 def match_knowledge_chunks(instagram_account_id, query_embedding, match_count=5):
@@ -278,6 +311,46 @@ def get_instagram_post(instagram_account_id, instagram_media_id):
             ),
         },
     )
+
+
+def list_instagram_post_media_ids(instagram_account_id, limit=1000):
+    rows = _request(
+        "GET",
+        "ig_posts",
+        params={
+            "instagram_account_id": f"eq.{instagram_account_id}",
+            "select": "instagram_media_id",
+            "limit": str(limit),
+        },
+    )
+    return [row["instagram_media_id"] for row in rows or [] if row.get("instagram_media_id")]
+
+
+def upsert_instagram_post(row):
+    return _upsert("ig_posts", row, "instagram_account_id,instagram_media_id")
+
+
+def create_promotion_setup(row):
+    return _insert("ig_promotion_setups", row)
+
+
+def get_promotion_setup(setup_id):
+    return _fetch_one(
+        "ig_promotion_setups",
+        {
+            "id": f"eq.{setup_id}",
+            "select": PROMOTION_SETUP_SELECT,
+        },
+    )
+
+
+def update_promotion_setup(setup_id, patch):
+    rows = _patch_returning(
+        "ig_promotion_setups",
+        {"id": f"eq.{setup_id}", "select": PROMOTION_SETUP_SELECT},
+        patch,
+    )
+    return rows[0] if rows else None
 
 
 def get_comment_by_instagram_id(instagram_account_id, instagram_comment_id):
