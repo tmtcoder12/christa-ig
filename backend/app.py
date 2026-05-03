@@ -529,6 +529,53 @@ def build_promotional_post_row(setup, media_item):
     }
 
 
+def build_regular_post_row(instagram_account_id, media_item, source):
+    timestamp = parse_meta_media_timestamp(media_item.get("timestamp"))
+    return {
+        "instagram_account_id": instagram_account_id,
+        "instagram_media_id": media_item["id"],
+        "caption": media_item.get("caption"),
+        "media_type": media_item.get("media_type"),
+        "media_url": media_item.get("media_url"),
+        "permalink": media_item.get("permalink"),
+        "posted_at": timestamp.isoformat() if timestamp else None,
+        "post_type": "regular",
+        "automation_enabled": False,
+        "extra_metadata": {
+            "source": source,
+            "meta_media": media_item,
+        },
+    }
+
+
+def sync_unknown_regular_media_before_promotion(account):
+    existing_media_ids = set(list_instagram_post_media_ids(account["id"]))
+    media_items = fetch_instagram_media(account["instagram_user_id"])
+    upserted_posts = []
+
+    for media_item in media_items:
+        if not isinstance(media_item, dict) or not media_item.get("id"):
+            continue
+        if media_item["id"] in existing_media_ids:
+            continue
+
+        post = upsert_instagram_post(
+            build_regular_post_row(
+                account["id"],
+                media_item,
+                source="promotion_setup_pre_sync",
+            )
+        )
+        if post:
+            upserted_posts.append(post)
+        existing_media_ids.add(media_item["id"])
+
+    return {
+        "upserted_count": len(upserted_posts),
+        "upserted_media_ids": [post["instagram_media_id"] for post in upserted_posts if post.get("instagram_media_id")],
+    }
+
+
 def run_promotion_setup_poll(setup_id):
     try:
         setup = get_promotion_setup(setup_id)
@@ -1297,9 +1344,13 @@ def create_promotion():
         return api_error("You do not have access to this Instagram account", 403)
 
     try:
+        pre_sync_result = sync_unknown_regular_media_before_promotion(account)
         baseline_media_ids = list_instagram_post_media_ids(account["id"])
     except SupabaseError as exc:
         return api_error(str(exc), 500)
+    except RuntimeError as exc:
+        return api_error(str(exc), 502)
+
     now = datetime.now(timezone.utc)
     setup_row = {
         "instagram_account_id": account["id"],
@@ -1317,6 +1368,7 @@ def create_promotion():
         "extra_metadata": {
             "baseline_count": len(baseline_media_ids),
             "submitted_from": "frontend-login",
+            "pre_sync": pre_sync_result,
         },
     }
 
