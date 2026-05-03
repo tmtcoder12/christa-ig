@@ -72,6 +72,16 @@ For RAG, insert embeddings into `knowledge_chunks` with the internal `instagram_
 
 If `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` is missing, local development falls back to the old in-memory history behavior.
 
+## Instagram media backfill
+
+When onboarding a connected Instagram account, backfill historical media into `ig_posts` with the internal `instagram_accounts.id` value:
+
+```bash
+python3 backend/backfill_instagram_media.py YOUR_INTERNAL_INSTAGRAM_ACCOUNT_UUID --limit 1
+```
+
+Omit `--limit` to walk all available Instagram media pages. The script stores historical media as regular posts with `automation_enabled = false`.
+
 ## Embedding ingestion
 
 The `embeddings/` folder contains a CLI for bulk-loading standardized JSONL data into `knowledge_chunks`.

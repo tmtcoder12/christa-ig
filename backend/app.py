@@ -22,14 +22,17 @@ from supabase_client import (
     get_instagram_account,
     get_instagram_account_by_id,
     get_instagram_post,
+    get_promo_code_by_code,
     get_promotion_setup,
     has_prior_comment_automation,
     insert_dm_message,
     is_configured as is_supabase_configured,
+    is_promo_code_valid,
     iso_from_meta_timestamp,
     list_instagram_post_media_ids,
     match_knowledge_chunks,
     message_exists,
+    redeem_promo_code,
     touch_dm_session,
     update_comment_automation,
     update_promotion_setup,
@@ -1169,8 +1172,103 @@ def verify_webhook():
 
 @app.route("/api/promotions", methods=["OPTIONS"])
 @app.route("/api/promotions/<setup_id>", methods=["OPTIONS"])
+@app.route("/api/promo-codes/redeem", methods=["OPTIONS"])
 def promotion_api_options(setup_id=None):
     return "", 204
+
+
+def serialize_promo_code_for_api(code_row):
+    if not code_row:
+        return None
+    return {
+        "id": code_row.get("id"),
+        "code": code_row.get("code"),
+        "status": code_row.get("status"),
+        "valid_from": code_row.get("valid_from"),
+        "expires_at": code_row.get("expires_at"),
+        "redeemed_at": code_row.get("redeemed_at"),
+    }
+
+
+def validate_redeem_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be a JSON object")
+
+    instagram_account_id = str(payload.get("instagram_account_id") or "").strip()
+    if not instagram_account_id:
+        raise ValueError("instagram_account_id is required")
+
+    code = str(payload.get("code") or "").strip().upper()
+    if not code:
+        raise ValueError("code is required")
+
+    return {
+        "instagram_account_id": instagram_account_id,
+        "code": code,
+    }
+
+
+@app.post("/api/promo-codes/redeem")
+def redeem_promo_code_api():
+    if not is_supabase_configured():
+        return api_error("Supabase is not configured", 500)
+
+    try:
+        user = get_authenticated_api_user()
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    if not user or not user.get("id"):
+        return api_error("Unauthorized", 401)
+
+    try:
+        redeem_input = validate_redeem_payload(request.get_json(silent=True))
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+    try:
+        account = user_has_instagram_account_access(user["id"], redeem_input["instagram_account_id"])
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+    if not account:
+        return api_error("You do not have access to this Instagram account", 403)
+
+    try:
+        expire_expired_promo_codes()
+        code_row = get_promo_code_by_code(account["id"], redeem_input["code"])
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    if not code_row:
+        return jsonify({"result": "not_found", "promo_code": None})
+
+    if code_row.get("status") == "issued" and not is_promo_code_valid(code_row):
+        try:
+            expire_expired_promo_codes()
+            code_row = get_promo_code_by_code(account["id"], redeem_input["code"]) or code_row
+        except SupabaseError as exc:
+            return api_error(str(exc), 500)
+
+    status = code_row.get("status")
+    if status == "expired":
+        return jsonify({"result": "expired", "promo_code": serialize_promo_code_for_api(code_row)})
+    if status == "redeemed":
+        return jsonify({"result": "already_redeemed", "promo_code": serialize_promo_code_for_api(code_row)})
+    if status == "void":
+        return jsonify({"result": "void", "promo_code": serialize_promo_code_for_api(code_row)})
+    if status != "issued":
+        return jsonify({"result": "not_found", "promo_code": None})
+
+    try:
+        redeemed_code = redeem_promo_code(code_row["id"], redeemed_by=user["id"])
+        if not redeemed_code:
+            refreshed_code = get_promo_code_by_code(account["id"], redeem_input["code"]) or code_row
+            result = "already_redeemed" if refreshed_code.get("status") == "redeemed" else refreshed_code.get("status")
+            return jsonify({"result": result, "promo_code": serialize_promo_code_for_api(refreshed_code)})
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    return jsonify({"result": "redeemed", "promo_code": serialize_promo_code_for_api(redeemed_code)})
 
 
 @app.post("/api/promotions")

@@ -290,11 +290,62 @@ def expire_expired_promo_codes(now=None):
         "ig_promo_codes",
         {
             "status": "eq.issued",
-            "expires_at": f"lt.{now.isoformat()}",
+            "expires_at": f"lte.{now.isoformat()}",
             "select": "id,code,instagram_account_id,post_id,contact_id,expires_at,status",
         },
         {"status": "expired"},
     )
+
+
+def get_promo_code_by_code(instagram_account_id, code):
+    return _fetch_one(
+        "ig_promo_codes",
+        {
+            "instagram_account_id": f"eq.{instagram_account_id}",
+            "code": f"eq.{code}",
+            "select": (
+                "id,instagram_account_id,post_id,contact_id,comment_id,code,status,"
+                "valid_from,expires_at,redeemed_at,extra_metadata,created_at,updated_at"
+            ),
+        },
+    )
+
+
+def redeem_promo_code(promo_code_id, redeemed_by=None):
+    now = datetime.now(timezone.utc).isoformat()
+    existing = _fetch_one(
+        "ig_promo_codes",
+        {
+            "id": f"eq.{promo_code_id}",
+            "select": "extra_metadata",
+        },
+    )
+    extra_metadata = existing.get("extra_metadata") if existing else {}
+    if not isinstance(extra_metadata, dict):
+        extra_metadata = {}
+    extra_metadata = {
+        **extra_metadata,
+        "redeemed_from": "frontend-login",
+        "redeemed_by": redeemed_by,
+    }
+
+    rows = _patch_returning(
+        "ig_promo_codes",
+        {
+            "id": f"eq.{promo_code_id}",
+            "status": "eq.issued",
+            "select": (
+                "id,instagram_account_id,post_id,contact_id,comment_id,code,status,"
+                "valid_from,expires_at,redeemed_at,extra_metadata,created_at,updated_at"
+            ),
+        },
+        {
+            "status": "redeemed",
+            "redeemed_at": now,
+            "extra_metadata": extra_metadata,
+        },
+    )
+    return rows[0] if rows else None
 
 
 def get_instagram_post(instagram_account_id, instagram_media_id):

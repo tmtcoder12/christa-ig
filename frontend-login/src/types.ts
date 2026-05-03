@@ -50,3 +50,24 @@ export type CreatePromotionSetupInput = {
   dm_prompt: string | null;
   code_prefix: string | null;
 };
+
+export type PromoCodeRedeemResult = 'redeemed' | 'expired' | 'not_found' | 'already_redeemed' | 'void';
+
+export type PromoCodeSummary = {
+  id: string;
+  code: string;
+  status: 'issued' | 'redeemed' | 'expired' | 'void';
+  valid_from: string | null;
+  expires_at: string | null;
+  redeemed_at: string | null;
+};
+
+export type RedeemPromoCodeInput = {
+  instagram_account_id: string;
+  code: string;
+};
+
+export type RedeemPromoCodeResponse = {
+  result: PromoCodeRedeemResult;
+  promo_code: PromoCodeSummary | null;
+};

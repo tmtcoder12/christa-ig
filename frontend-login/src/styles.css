@@ -266,6 +266,18 @@ textarea {
   padding: 22px;
 }
 
+.form-panel > label {
+  color: #475155;
+  display: grid;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 7px;
+}
+
+.redeem-panel {
+  max-width: 560px;
+}
+
 .form-grid {
   display: grid;
   gap: 16px;
@@ -310,6 +322,22 @@ textarea {
   color: #1e2528;
   margin: 0;
   overflow-wrap: anywhere;
+}
+
+.redeem-result p {
+  color: #5a6468;
+  margin: 8px 0 0;
+}
+
+.redeem-result-redeemed {
+  border-color: #95cdb7;
+}
+
+.redeem-result-expired,
+.redeem-result-already_redeemed,
+.redeem-result-void,
+.redeem-result-not_found {
+  border-color: #e6c191;
 }
 
 @media (max-width: 820px) {
