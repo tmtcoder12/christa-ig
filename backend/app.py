@@ -1532,7 +1532,7 @@ def schedule_promo_code_followup(promo_code):
         promo_code,
         scheduled_for.isoformat(),
         message_text,
-        message_tag="POST_PURCHASE_UPDATE",
+        message_tag="NOTIFICATION_MESSAGE",
         extra_metadata={
             "source": "promo_code_redemption",
             "followup_delay_minutes": delay_minutes,

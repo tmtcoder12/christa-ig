@@ -385,7 +385,7 @@ create table if not exists public.ig_promo_code_followups (
     status = any (array['pending', 'sending', 'sent', 'failed', 'cancelled'])
   ),
   message_text text not null,
-  message_tag text not null default 'POST_PURCHASE_UPDATE',
+  message_tag text not null default 'NOTIFICATION_MESSAGE',
   instagram_message_id text,
   error_message text,
   attempt_count integer not null default 0 check (attempt_count >= 0),

@@ -146,7 +146,7 @@ Promo code validity is controlled by `promo_code_valid_duration_hours` on the po
 - Expiration is checked from `ig_promo_codes.expires_at`; when webhook traffic is processed, issued codes with `expires_at < now()` are marked `expired`.
 - `status = 'expired'` means the validity window has passed; `redeemed` means the code was used; `void` means an admin/manual flow invalidated it.
 
-When a staff user redeems a promo code through the `frontend-login` Redeem page, the backend creates one durable `ig_promo_code_followups` row for that promo code. By default, the follow-up is scheduled for 10 minutes after `ig_promo_codes.redeemed_at`, uses the static post-purchase message text, and is sent with the configured `POST_PURCHASE_UPDATE` message tag.
+When a staff user redeems a promo code through the `frontend-login` Redeem page, the backend creates one durable `ig_promo_code_followups` row for that promo code. By default, the follow-up is scheduled for 10 minutes after `ig_promo_codes.redeemed_at`, uses the static post-purchase message text, and is sent with the configured `NOTIFICATION_MESSAGE` message tag.
 
 Follow-ups are not sent by an in-memory timer. Run the due-message processor from a cron service such as Render Cron or Supabase cron:
 

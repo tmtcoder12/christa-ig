@@ -437,7 +437,7 @@ def ensure_promo_code_followup(
     promo_code,
     scheduled_for,
     message_text,
-    message_tag="POST_PURCHASE_UPDATE",
+    message_tag="NOTIFICATION_MESSAGE",
     extra_metadata=None,
 ):
     existing = _fetch_one(
