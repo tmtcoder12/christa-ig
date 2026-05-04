@@ -1,6 +1,8 @@
 import type {
   CreateKnowledgeChunkInput,
   CreatePromotionSetupInput,
+  FetchKnowledgeChunksInput,
+  FetchKnowledgeChunksResponse,
   KnowledgeChunk,
   PromotionSetup,
   RedeemPromoCodeInput,
@@ -44,9 +46,19 @@ export async function redeemPromoCode(input: RedeemPromoCodeInput, accessToken: 
   });
 }
 
-export async function fetchKnowledgeChunks(instagramAccountId: string, accessToken: string) {
-  const query = new URLSearchParams({ instagram_account_id: instagramAccountId });
-  return apiRequest<{ chunks: KnowledgeChunk[] }>(`/api/knowledge-chunks?${query.toString()}`, accessToken);
+export async function fetchKnowledgeChunks(input: FetchKnowledgeChunksInput, accessToken: string) {
+  const query = new URLSearchParams({
+    instagram_account_id: input.instagram_account_id,
+    page: String(input.page),
+    page_size: String(input.page_size),
+  });
+  if (input.type) {
+    query.set('type', input.type);
+  }
+  if (input.category) {
+    query.set('category', input.category);
+  }
+  return apiRequest<FetchKnowledgeChunksResponse>(`/api/knowledge-chunks?${query.toString()}`, accessToken);
 }
 
 export async function createKnowledgeChunk(input: CreateKnowledgeChunkInput, accessToken: string) {

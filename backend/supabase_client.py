@@ -184,18 +184,54 @@ def match_knowledge_chunks(instagram_account_id, query_embedding, match_count=5)
     return rows or []
 
 
-def list_knowledge_chunks(instagram_account_id, limit=100):
+def list_knowledge_chunks(instagram_account_id, limit=20, offset=0, chunk_type=None, category=None):
+    params = {
+        "instagram_account_id": f"eq.{instagram_account_id}",
+        "select": KNOWLEDGE_CHUNK_SELECT,
+        "order": "created_at.desc",
+        "limit": str(limit),
+        "offset": str(offset),
+    }
+    if chunk_type:
+        params["type"] = f"eq.{chunk_type}"
+    if category:
+        params["extra_metadata->>category"] = f"eq.{category}"
+
+    rows = _request(
+        "GET",
+        "knowledge_chunks",
+        params=params,
+    )
+    return rows or []
+
+
+def list_knowledge_chunk_filter_values(instagram_account_id, limit=1000):
     rows = _request(
         "GET",
         "knowledge_chunks",
         params={
             "instagram_account_id": f"eq.{instagram_account_id}",
-            "select": KNOWLEDGE_CHUNK_SELECT,
-            "order": "created_at.desc",
+            "select": "type,extra_metadata",
             "limit": str(limit),
         },
     )
-    return rows or []
+    types = set()
+    categories = set()
+    for row in rows or []:
+        chunk_type = row.get("type")
+        if chunk_type:
+            types.add(str(chunk_type))
+
+        extra_metadata = row.get("extra_metadata") or {}
+        if isinstance(extra_metadata, dict):
+            category = extra_metadata.get("category")
+            if category:
+                categories.add(str(category))
+
+    return {
+        "types": sorted(types, key=str.casefold),
+        "categories": sorted(categories, key=str.casefold),
+    }
 
 
 def insert_knowledge_chunk(row):

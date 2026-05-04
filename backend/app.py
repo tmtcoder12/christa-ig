@@ -31,6 +31,7 @@ from supabase_client import (
     is_configured as is_supabase_configured,
     is_promo_code_valid,
     iso_from_meta_timestamp,
+    list_knowledge_chunk_filter_values,
     list_knowledge_chunks,
     list_instagram_post_media_ids,
     match_knowledge_chunks,
@@ -1327,7 +1328,23 @@ def validate_knowledge_chunk_payload(payload):
         "type": clean_optional_string(payload.get("type")),
         "source_url": clean_optional_string(payload.get("source_url")),
         "page_path": clean_optional_string(payload.get("page_path")),
+        "category": clean_optional_string(payload.get("category")),
     }
+
+
+def parse_positive_int_arg(name, default, maximum=None):
+    raw = request.args.get(name)
+    if raw in (None, ""):
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be an integer") from exc
+    if value <= 0:
+        raise ValueError(f"{name} must be greater than 0")
+    if maximum is not None:
+        return min(value, maximum)
+    return value
 
 
 @app.get("/api/knowledge-chunks")
@@ -1348,6 +1365,15 @@ def get_knowledge_chunks_api():
         return api_error("instagram_account_id is required", 400)
 
     try:
+        page = parse_positive_int_arg("page", 1)
+        page_size = parse_positive_int_arg("page_size", 10, maximum=50)
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+    chunk_type = clean_optional_string(request.args.get("type"))
+    category = clean_optional_string(request.args.get("category"))
+
+    try:
         account = user_has_instagram_account_access(user["id"], instagram_account_id)
     except SupabaseError as exc:
         return api_error(str(exc), 500)
@@ -1355,11 +1381,30 @@ def get_knowledge_chunks_api():
         return api_error("You do not have access to this Instagram account", 403)
 
     try:
-        chunks = list_knowledge_chunks(account["id"])
+        rows = list_knowledge_chunks(
+            account["id"],
+            limit=page_size + 1,
+            offset=(page - 1) * page_size,
+            chunk_type=chunk_type,
+            category=category,
+        )
+        filter_values = list_knowledge_chunk_filter_values(account["id"])
     except SupabaseError as exc:
         return api_error(str(exc), 500)
 
-    return jsonify({"chunks": [serialize_knowledge_chunk_for_api(chunk) for chunk in chunks]})
+    has_more = len(rows) > page_size
+    chunks = rows[:page_size]
+    return jsonify(
+        {
+            "chunks": [serialize_knowledge_chunk_for_api(chunk) for chunk in chunks],
+            "pagination": {
+                "page": page,
+                "page_size": page_size,
+                "has_more": has_more,
+            },
+            "filters": filter_values,
+        }
+    )
 
 
 @app.post("/api/knowledge-chunks")
@@ -1403,6 +1448,7 @@ def create_knowledge_chunk_api():
         "extra_metadata": {
             "source": "frontend-login",
             "created_by": user["id"],
+            **({"category": chunk_input["category"]} if chunk_input["category"] else {}),
         },
         "content_hash": hashlib.sha256(chunk_input["text"].encode("utf-8")).hexdigest(),
         "embedding": embedding,

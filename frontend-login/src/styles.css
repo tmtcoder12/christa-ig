@@ -352,6 +352,32 @@ textarea {
   gap: 14px;
 }
 
+.knowledge-controls,
+.pagination-controls {
+  align-items: center;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+.knowledge-controls label {
+  color: #475155;
+  display: grid;
+  font-size: 13px;
+  font-weight: 700;
+  gap: 7px;
+  min-width: 180px;
+}
+
+.pagination-controls {
+  justify-content: flex-end;
+}
+
+.pagination-controls span {
+  color: #475155;
+  font-weight: 700;
+}
+
 .knowledge-card {
   border: 1px solid #ded9cf;
   border-radius: 8px;
@@ -435,5 +461,15 @@ textarea {
   .knowledge-list-header {
     align-items: stretch;
     flex-direction: column;
+  }
+
+  .knowledge-controls,
+  .pagination-controls {
+    align-items: stretch;
+    flex-direction: column;
+  }
+
+  .knowledge-controls label {
+    min-width: 0;
   }
 }

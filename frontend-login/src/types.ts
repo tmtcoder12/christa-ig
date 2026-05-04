@@ -91,6 +91,32 @@ export type CreateKnowledgeChunkInput = {
   text: string;
   title: string | null;
   type: string | null;
+  category: string | null;
   source_url: string | null;
   page_path: string | null;
+};
+
+export type KnowledgeChunkFilters = {
+  types: string[];
+  categories: string[];
+};
+
+export type KnowledgeChunkPagination = {
+  page: number;
+  page_size: number;
+  has_more: boolean;
+};
+
+export type FetchKnowledgeChunksInput = {
+  instagram_account_id: string;
+  page: number;
+  page_size: number;
+  type: string | null;
+  category: string | null;
+};
+
+export type FetchKnowledgeChunksResponse = {
+  chunks: KnowledgeChunk[];
+  pagination: KnowledgeChunkPagination;
+  filters: KnowledgeChunkFilters;
 };
