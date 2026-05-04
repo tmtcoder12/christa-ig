@@ -29,6 +29,16 @@ PROMO_CODE_FOLLOWUP_SELECT = (
     "message_text,message_tag,instagram_message_id,error_message,attempt_count,"
     "extra_metadata,created_at,updated_at"
 )
+PROMO_LEAD_SELECT = (
+    "id,instagram_account_id,post_id,contact_id,comment_id,promo_code_id,"
+    "customer_name,phone_raw,phone_e164,sms_consent_at,status,error_message,"
+    "extra_metadata,created_at,updated_at"
+)
+SMS_MESSAGE_SELECT = (
+    "id,instagram_account_id,contact_id,promo_code_id,promo_lead_id,to_phone_e164,"
+    "body,purpose,status,scheduled_for,sent_at,twilio_message_sid,error_message,"
+    "attempt_count,extra_metadata,created_at,updated_at"
+)
 
 
 class SupabaseError(Exception):
@@ -262,6 +272,27 @@ def ensure_contact(instagram_account_id, sender_id, username=None):
         row["username"] = username
 
     return _upsert("ig_contacts", row, "instagram_account_id,instagram_user_id")
+
+
+def update_contact_sms_details(contact_id, customer_name=None, phone_raw=None, phone_e164=None, sms_consent_at=None):
+    patch = {
+        "last_seen_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if customer_name:
+        patch["display_name"] = customer_name
+    if phone_raw:
+        patch["phone_raw"] = phone_raw
+    if phone_e164:
+        patch["phone_e164"] = phone_e164
+    if sms_consent_at:
+        patch["sms_consent_at"] = sms_consent_at
+
+    rows = _patch_returning(
+        "ig_contacts",
+        {"id": f"eq.{contact_id}", "select": "id,instagram_account_id,instagram_user_id,username,display_name,phone_raw,phone_e164,sms_consent_at"},
+        patch,
+    )
+    return rows[0] if rows else None
 
 
 def normalize_promo_code_prefix(prefix):
@@ -544,9 +575,161 @@ def get_contact_by_id(contact_id):
         "ig_contacts",
         {
             "id": f"eq.{contact_id}",
-            "select": "id,instagram_account_id,instagram_user_id,username",
+            "select": "id,instagram_account_id,instagram_user_id,username,display_name,phone_raw,phone_e164,sms_consent_at",
         },
     )
+
+
+def ensure_promo_lead(
+    instagram_account_id,
+    post_id,
+    contact_id,
+    comment_id,
+    promo_code_id,
+    extra_metadata=None,
+):
+    existing = _fetch_one(
+        "ig_promo_leads",
+        {
+            "promo_code_id": f"eq.{promo_code_id}",
+            "select": PROMO_LEAD_SELECT,
+        },
+    )
+    if existing:
+        return existing
+
+    row = {
+        "instagram_account_id": instagram_account_id,
+        "post_id": post_id,
+        "contact_id": contact_id,
+        "comment_id": comment_id,
+        "promo_code_id": promo_code_id,
+        "status": "collecting",
+        "extra_metadata": extra_metadata or {},
+    }
+    try:
+        return _insert("ig_promo_leads", row)
+    except SupabaseError as exc:
+        if "ig_promo_leads_promo_code_key" not in str(exc):
+            raise
+        return _fetch_one(
+            "ig_promo_leads",
+            {
+                "promo_code_id": f"eq.{promo_code_id}",
+                "select": PROMO_LEAD_SELECT,
+            },
+        )
+
+
+def get_collecting_promo_lead(contact_id):
+    return _fetch_one(
+        "ig_promo_leads",
+        {
+            "contact_id": f"eq.{contact_id}",
+            "status": "eq.collecting",
+            "select": PROMO_LEAD_SELECT,
+            "order": "created_at.desc",
+        },
+    )
+
+
+def get_promo_lead_by_promo_code(promo_code_id):
+    return _fetch_one(
+        "ig_promo_leads",
+        {
+            "promo_code_id": f"eq.{promo_code_id}",
+            "select": PROMO_LEAD_SELECT,
+        },
+    )
+
+
+def update_promo_lead(lead_id, patch):
+    rows = _patch_returning(
+        "ig_promo_leads",
+        {"id": f"eq.{lead_id}", "select": PROMO_LEAD_SELECT},
+        patch,
+    )
+    return rows[0] if rows else None
+
+
+def create_sms_message(row):
+    return _insert("ig_sms_messages", row)
+
+
+def get_redemption_followup_sms_by_promo_code(promo_code_id):
+    return _fetch_one(
+        "ig_sms_messages",
+        {
+            "promo_code_id": f"eq.{promo_code_id}",
+            "purpose": "eq.post_redemption_followup",
+            "select": SMS_MESSAGE_SELECT,
+        },
+    )
+
+
+def list_due_sms_messages(now=None, limit=20):
+    now = now or datetime.now(timezone.utc)
+    rows = _request(
+        "GET",
+        "ig_sms_messages",
+        params={
+            "status": "eq.pending",
+            "scheduled_for": f"lte.{now.isoformat()}",
+            "select": SMS_MESSAGE_SELECT,
+            "order": "scheduled_for.asc",
+            "limit": str(limit),
+        },
+    )
+    return rows or []
+
+
+def claim_sms_message(sms_message_id):
+    rows = _patch_returning(
+        "ig_sms_messages",
+        {
+            "id": f"eq.{sms_message_id}",
+            "status": "eq.pending",
+            "select": SMS_MESSAGE_SELECT,
+        },
+        {"status": "sending"},
+    )
+    return rows[0] if rows else None
+
+
+def mark_sms_message_sent(sms_message_id, twilio_message_sid=None, extra_metadata=None):
+    patch = {
+        "status": "sent",
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "error_message": None,
+    }
+    if twilio_message_sid:
+        patch["twilio_message_sid"] = twilio_message_sid
+    if extra_metadata is not None:
+        patch["extra_metadata"] = extra_metadata
+
+    rows = _patch_returning(
+        "ig_sms_messages",
+        {"id": f"eq.{sms_message_id}", "select": SMS_MESSAGE_SELECT},
+        patch,
+    )
+    return rows[0] if rows else None
+
+
+def mark_sms_message_failed(sms_message, error_message, extra_metadata=None):
+    patch = {
+        "status": "failed",
+        "error_message": error_message,
+        "attempt_count": int(sms_message.get("attempt_count") or 0) + 1,
+    }
+    if extra_metadata is not None:
+        patch["extra_metadata"] = extra_metadata
+
+    rows = _patch_returning(
+        "ig_sms_messages",
+        {"id": f"eq.{sms_message['id']}", "select": SMS_MESSAGE_SELECT},
+        patch,
+    )
+    return rows[0] if rows else None
 
 
 def get_instagram_post(instagram_account_id, instagram_media_id):

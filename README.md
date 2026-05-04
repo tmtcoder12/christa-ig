@@ -6,7 +6,7 @@ This repo is organized as a small monorepo:
 - `frontend-login/` contains the Vite React UI for authenticated business users.
 - `embeddings/` contains the CLI flow for embedding JSONL knowledge chunks and upserting them into Supabase.
 
-The backend Flask app receives Meta webhook requests on Render. It supports webhook verification, replies to inbound Instagram DMs with OpenAI-generated text, can trigger comment-to-DM automations on promotional posts, and can use Supabase `pgvector` knowledge chunks as RAG context.
+The backend Flask app receives Meta webhook requests on Render. It supports webhook verification, replies to inbound Instagram DMs with OpenAI-generated text, can trigger comment-to-DM automations on promotional posts, can send promo-code and follow-up SMS messages through Twilio, and can use Supabase `pgvector` knowledge chunks as RAG context.
 
 ## Endpoints
 
@@ -16,7 +16,7 @@ The backend Flask app receives Meta webhook requests on Render. It supports webh
 
 For inbound text `dm-related` webhook events, the app looks up the connected Instagram account in Supabase, persists the contact/session/messages, retrieves relevant `knowledge_chunks` for that Instagram account, generates a reply with OpenAI from database-backed chat history plus RAG context, stores the assistant reply, and sends the reply back to the message sender.
 
-For `comment-related` webhook events, promotional posts can be configured with trigger keywords. When a matching comment arrives, the app stores the comment, issues or reuses a unique promo code for that customer/post, sends a static public comment reply, retrieves relevant knowledge chunks, generates a private reply DM with OpenAI, and sends it using Meta's comment private-reply flow.
+For `comment-related` webhook events, promotional posts can be configured with trigger keywords. When a matching comment arrives, the app stores the comment, issues or reuses a unique promo code for that customer/post, sends a static public comment reply, creates a promo lead, and sends a private Instagram reply asking the commenter for their name and phone number. Once the customer provides those details in DM, the backend sends the promo code by Twilio SMS.
 
 ## Environment variables
 
@@ -34,8 +34,11 @@ For `comment-related` webhook events, promotional posts can be configured with t
 - `RAG_ENABLED` optionally enables or disables knowledge retrieval. Defaults to `true`.
 - `RAG_MATCH_COUNT` optionally sets how many knowledge chunks are sent to OpenAI. Defaults to `5`.
 - `FOLLOWUP_CRON_SECRET` protects the follow-up processor endpoint.
-- `FOLLOWUP_DELAY_MINUTES` optionally sets the delay between promo-code redemption and the follow-up DM. Defaults to `10`.
+- `FOLLOWUP_DELAY_MINUTES` optionally sets the delay between promo-code redemption and the follow-up SMS. Defaults to `10`.
 - `FOLLOWUP_BATCH_SIZE` optionally sets how many due follow-ups one processor call handles. Defaults to `20`.
+- `TWILIO_ACCOUNT_SID` is the Twilio account SID used for SMS delivery.
+- `TWILIO_AUTH_TOKEN` is the Twilio auth token used for SMS delivery. Keep this server-side only.
+- `TWILIO_MESSAGING_SERVICE_SID` is the Twilio Messaging Service SID used as the SMS sender.
 - `PORT` is provided by Render automatically.
 
 The `frontend-login` Vite app also uses browser-safe frontend env vars:
@@ -136,7 +139,9 @@ Automation is limited to one attempted DM per `post_id` and `contact_id`. The ap
 - If `automation_starts_at` is in the future, comments are stored but no public reply, DM, or promo code is sent yet.
 - If `automation_ends_at` has passed, comments are stored but no public reply, DM, or promo code is sent.
 
-The app stores one readable promo code per customer/post in `ig_promo_codes` and includes that exact code in the private reply DM. If `promotion_metadata.code_prefix` is not set, codes use the `PROMO` prefix.
+The app stores one readable promo code per customer/post in `ig_promo_codes`, but the initial Instagram DM does not reveal the code. Instead, the DM asks the customer to reply with their name and phone number so the code can be texted to them. The lead-capture state is stored in `ig_promo_leads`, and successful SMS sends are logged in `ig_sms_messages`. If `promotion_metadata.code_prefix` is not set, codes use the `PROMO` prefix.
+
+Inbound DMs are checked for an active collecting promo lead before the normal RAG chatbot path. The app extracts the customer name and phone number, normalizes US/Canada phone numbers to E.164, stores consent timing, and sends the promo code by Twilio SMS once both fields are available. If either field is missing or the phone number cannot be normalized, the Instagram reply asks only for the missing detail.
 
 Promo code validity is controlled by `promo_code_valid_duration_hours` on the post:
 
@@ -146,7 +151,7 @@ Promo code validity is controlled by `promo_code_valid_duration_hours` on the po
 - Expiration is checked from `ig_promo_codes.expires_at`; when webhook traffic is processed, issued codes with `expires_at < now()` are marked `expired`.
 - `status = 'expired'` means the validity window has passed; `redeemed` means the code was used; `void` means an admin/manual flow invalidated it.
 
-When a staff user redeems a promo code through the `frontend-login` Redeem page, the backend creates one durable `ig_promo_code_followups` row for that promo code. By default, the follow-up is scheduled for 10 minutes after `ig_promo_codes.redeemed_at`, uses the static post-purchase message text, and is sent with the configured `NOTIFICATION_MESSAGE` message tag.
+When a staff user redeems a promo code through the `frontend-login` Redeem page, the backend creates one durable `ig_sms_messages` row for that promo code with `purpose = 'post_redemption_followup'`. By default, the follow-up SMS is scheduled for 10 minutes after `ig_promo_codes.redeemed_at` and is sent to the phone number collected for the promo lead.
 
 Follow-ups are not sent by an in-memory timer. Run the due-message processor from a cron service such as Render Cron or Supabase cron:
 
@@ -155,7 +160,7 @@ curl -X POST https://YOUR_BACKEND_HOST/api/followups/process-due \
   -H "X-Followup-Cron-Secret: YOUR_FOLLOWUP_CRON_SECRET"
 ```
 
-The processor finds pending rows with `scheduled_for <= now()`, sends the Instagram DM, records the outbound DM in `ig_dm_messages` when possible, then marks the follow-up `sent` or `failed`.
+The processor finds pending SMS rows with `scheduled_for <= now()`, sends them through Twilio, then marks each row `sent` or `failed`.
 
 The `frontend-login` Add Promotion page creates a pending `ig_promotion_setups` row through `POST /api/promotions`. The backend snapshots the selected account's existing `ig_posts.instagram_media_id` values, polls Instagram media every 30 seconds for up to 5 minutes, and turns the newest unseen media item into a promotional `ig_posts` row. Only one pending/polling setup can exist per Instagram account.
 

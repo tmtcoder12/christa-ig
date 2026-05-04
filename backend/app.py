@@ -1,7 +1,9 @@
+import base64
 import hashlib
 import json
 import logging
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -10,41 +12,48 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, jsonify, request
-from openai_client import generate_query_embedding, generate_reply
+from openai_client import extract_lead_contact_info, generate_query_embedding, generate_reply
 from supabase_client import (
     SupabaseError,
+    claim_sms_message,
     create_promotion_setup,
+    create_sms_message,
     ensure_contact,
     ensure_dm_session,
     expire_expired_promo_codes,
     ensure_promo_code,
-    ensure_promo_code_followup,
+    ensure_promo_lead,
     fetch_dm_history,
     get_comment_by_instagram_id,
     get_contact_by_id,
+    get_collecting_promo_lead,
     get_instagram_account,
     get_instagram_account_by_id,
     get_instagram_post,
+    get_promo_code_by_id,
     get_promo_code_by_code,
+    get_promo_lead_by_promo_code,
     get_promotion_setup,
+    get_redemption_followup_sms_by_promo_code,
     has_prior_comment_automation,
     insert_dm_message,
     insert_knowledge_chunk,
     is_configured as is_supabase_configured,
     is_promo_code_valid,
     iso_from_meta_timestamp,
-    list_due_promo_code_followups,
+    list_due_sms_messages,
     list_knowledge_chunk_filter_values,
     list_knowledge_chunks,
     list_instagram_post_media_ids,
-    mark_promo_code_followup_failed,
-    mark_promo_code_followup_sent,
+    mark_sms_message_failed,
+    mark_sms_message_sent,
     match_knowledge_chunks,
     message_exists,
     redeem_promo_code,
-    claim_promo_code_followup,
     touch_dm_session,
+    update_contact_sms_details,
     update_comment_automation,
+    update_promo_lead,
     update_promotion_setup,
     upsert_instagram_post,
     upsert_comment,
@@ -103,6 +112,119 @@ def parse_int_env(name, default):
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def normalize_phone_number(raw_phone):
+    raw = str(raw_phone or "").strip()
+    if not raw:
+        return None
+
+    if raw.startswith("+"):
+        digits = re.sub(r"\D", "", raw)
+        return f"+{digits}" if 8 <= len(digits) <= 15 else None
+
+    digits = re.sub(r"\D", "", raw)
+    if len(digits) == 10:
+        return f"+1{digits}"
+    if len(digits) == 11 and digits.startswith("1"):
+        return f"+{digits}"
+    return None
+
+
+def require_twilio_config():
+    account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    messaging_service_sid = os.environ.get("TWILIO_MESSAGING_SERVICE_SID", "").strip()
+    if not account_sid or not auth_token or not messaging_service_sid:
+        raise RuntimeError("TWILIO_ACCOUNT_SID, TWILIO_AUTH_TOKEN, and TWILIO_MESSAGING_SERVICE_SID must be set")
+    return account_sid, auth_token, messaging_service_sid
+
+
+def send_twilio_sms(to_phone_e164, body):
+    try:
+        account_sid, auth_token, messaging_service_sid = require_twilio_config()
+    except RuntimeError as exc:
+        return {"success": False, "error": str(exc)}
+
+    payload = urllib.parse.urlencode(
+        {
+            "To": to_phone_e164,
+            "MessagingServiceSid": messaging_service_sid,
+            "Body": body,
+        }
+    ).encode("utf-8")
+    credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode("utf-8")).decode("ascii")
+    api_request = urllib.request.Request(
+        f"https://api.twilio.com/2010-04-01/Accounts/{account_sid}/Messages.json",
+        data=payload,
+        headers={
+            "Authorization": f"Basic {credentials}",
+            "Content-Type": "application/x-www-form-urlencoded",
+            "Accept": "application/json",
+        },
+        method="POST",
+    )
+
+    try:
+        with urllib.request.urlopen(api_request, timeout=10) as response:
+            parsed_body = json.loads(response.read().decode("utf-8"))
+            return {
+                "success": True,
+                "status_code": response.status,
+                "data": parsed_body,
+                "sid": parsed_body.get("sid"),
+            }
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        return {"success": False, "status_code": exc.code, "error": error_body}
+    except urllib.error.URLError as exc:
+        return {"success": False, "error": str(exc.reason)}
+    except json.JSONDecodeError as exc:
+        return {"success": False, "error": f"Invalid JSON response: {exc}"}
+
+
+def create_and_send_sms(
+    instagram_account_id,
+    contact_id,
+    to_phone_e164,
+    body,
+    purpose,
+    promo_code_id=None,
+    promo_lead_id=None,
+    extra_metadata=None,
+):
+    sms_message = create_sms_message(
+        {
+            "instagram_account_id": instagram_account_id,
+            "contact_id": contact_id,
+            "promo_code_id": promo_code_id,
+            "promo_lead_id": promo_lead_id,
+            "to_phone_e164": to_phone_e164,
+            "body": body,
+            "purpose": purpose,
+            "status": "sending",
+            "extra_metadata": extra_metadata or {},
+        }
+    )
+    send_response = send_twilio_sms(to_phone_e164, body)
+    merged_metadata = {
+        **(sms_message.get("extra_metadata") or {}),
+        "twilio_response": send_response,
+    }
+    if send_response.get("success"):
+        updated_sms = mark_sms_message_sent(
+            sms_message["id"],
+            twilio_message_sid=send_response.get("sid"),
+            extra_metadata=merged_metadata,
+        )
+        return updated_sms, send_response
+
+    updated_sms = mark_sms_message_failed(
+        sms_message,
+        send_response.get("error") or "Twilio SMS send failed",
+        extra_metadata=merged_metadata,
+    )
+    return updated_sms, send_response
 
 
 def classify_meta_event(payload):
@@ -255,38 +377,24 @@ def find_matched_keyword(comment_text, keywords):
     return None
 
 
-def build_comment_dm_input(post, comment_info, matched_keyword, promo_code=None):
-    campaign_prompt = post.get("dm_prompt") or ""
-    caption = post.get("caption") or ""
-    lines = [
-        "Generate a concise Instagram DM private reply for a user who commented on a promotional post.",
-    ]
-    if promo_code:
-        lines.append(f"Include this exact promo code in the DM and do not alter it: {promo_code}")
-    lines.extend(
-        [
-            "",
-            f"Post caption: {caption}",
-            f"Campaign instructions: {campaign_prompt}",
-            f"Matched keyword: {matched_keyword}",
-            f"Comment text: {comment_info['comment_text']}",
-        ]
-    )
-    if promo_code:
-        lines.append(f"Promo code: {promo_code}")
-    content = "\n".join(lines)
-    return [{"role": "user", "content": content}]
+def build_lead_capture_dm_text():
+    return "Thanks! Reply with your name and phone number and we'll text you the promo code."
 
 
-def ensure_reply_contains_promo_code(reply_text, promo_code):
-    if not promo_code or promo_code in (reply_text or ""):
-        return reply_text
+def build_missing_lead_fields_reply(has_name, has_phone):
+    if not has_name and not has_phone:
+        return "Please reply with your name and phone number so we can text you the promo code."
+    if not has_name:
+        return "Thanks, I have your phone number. What name should we put with the promo code?"
+    return "Thanks, I have your name. What phone number should we text the promo code to?"
 
-    reply_text = (reply_text or "").strip()
-    suffix = f"Your code is {promo_code}."
-    if not reply_text:
-        return suffix
-    return f"{reply_text}\n\n{suffix}"
+
+def build_code_sms_body(promo_code):
+    return f"Your promo code is {promo_code['code']}. Show this code when you redeem your offer."
+
+
+def build_sms_followup_body(promo_code):
+    return f"Thanks for visiting and using code {promo_code['code']}! How was your experience?"
 
 
 def parse_db_timestamp(value):
@@ -707,6 +815,158 @@ def get_sent_instagram_message_id(send_message_response):
     return data.get("message_id") or data.get("id")
 
 
+def clean_extracted_text(value):
+    if value is None:
+        return None
+    cleaned = str(value).strip()
+    if not cleaned or cleaned.lower() in {"null", "none", "unknown", "n/a"}:
+        return None
+    return cleaned
+
+
+def fallback_phone_from_text(text):
+    match = re.search(r"(\+?\d[\d\s().-]{7,}\d)", text or "")
+    return match.group(1).strip() if match else None
+
+
+def handle_promo_lead_capture(instagram_account, contact, session, history, message_text, inbound_message, event_type, payload):
+    lead = get_collecting_promo_lead(contact["id"])
+    if not lead:
+        return None
+
+    extraction = extract_lead_contact_info(history)
+    extracted_name = clean_extracted_text(extraction.get("customer_name"))
+    extracted_phone = clean_extracted_text(extraction.get("phone")) or fallback_phone_from_text(message_text)
+
+    customer_name = extracted_name or lead.get("customer_name")
+    phone_raw = extracted_phone or lead.get("phone_raw")
+    phone_e164 = normalize_phone_number(phone_raw) or lead.get("phone_e164")
+    has_name = bool(customer_name)
+    has_phone = bool(phone_e164)
+    now = datetime.now(timezone.utc).isoformat()
+    lead_metadata = lead.get("extra_metadata") or {}
+    if not isinstance(lead_metadata, dict):
+        lead_metadata = {}
+    lead_metadata = {
+        **lead_metadata,
+        "last_extraction": extraction,
+    }
+
+    lead_patch = {
+        "customer_name": customer_name,
+        "phone_raw": phone_raw,
+        "phone_e164": phone_e164,
+        "extra_metadata": lead_metadata,
+    }
+
+    sms_message = None
+    sms_response = None
+    if has_name and has_phone:
+        lead_patch["sms_consent_at"] = lead.get("sms_consent_at") or now
+        lead_patch["status"] = "ready"
+        update_contact_sms_details(
+            contact["id"],
+            customer_name=customer_name,
+            phone_raw=phone_raw,
+            phone_e164=phone_e164,
+            sms_consent_at=lead_patch["sms_consent_at"],
+        )
+        lead = update_promo_lead(lead["id"], lead_patch) or lead
+        promo_code = get_promo_code_by_id(lead["promo_code_id"])
+        sms_message, sms_response = create_and_send_sms(
+            instagram_account["id"],
+            contact["id"],
+            phone_e164,
+            build_code_sms_body(promo_code),
+            purpose="promo_code",
+            promo_code_id=promo_code["id"],
+            promo_lead_id=lead["id"],
+            extra_metadata={"source": "instagram_lead_capture"},
+        )
+        if sms_response.get("success"):
+            lead = update_promo_lead(
+                lead["id"],
+                {
+                    "status": "code_sms_sent",
+                    "error_message": None,
+                    "extra_metadata": {
+                        **(lead.get("extra_metadata") or {}),
+                        "last_sms_message_id": sms_message["id"] if sms_message else None,
+                    },
+                },
+            ) or lead
+            reply_text = "Perfect - I just texted your promo code to that number."
+            processing_result = "promo_lead_code_sms_sent"
+            processing_status = "processed"
+            error_message = None
+        else:
+            error_message = sms_response.get("error") or "Twilio SMS send failed"
+            lead = update_promo_lead(
+                lead["id"],
+                {
+                    "status": "code_sms_failed",
+                    "error_message": error_message,
+                    "extra_metadata": {
+                        **(lead.get("extra_metadata") or {}),
+                        "last_sms_message_id": sms_message["id"] if sms_message else None,
+                    },
+                },
+            ) or lead
+            reply_text = "I could not send the text just now. Please double-check your phone number and send it again."
+            processing_result = "promo_lead_code_sms_failed"
+            processing_status = "failed"
+    else:
+        lead = update_promo_lead(lead["id"], lead_patch) or lead
+        reply_text = build_missing_lead_fields_reply(has_name, has_phone)
+        processing_result = "promo_lead_collecting"
+        processing_status = "processed"
+        error_message = None
+
+    send_message_response = send_instagram_dm(contact["instagram_user_id"], reply_text)
+    sent_message_id = get_sent_instagram_message_id(send_message_response)
+    delivery_status = "sent" if send_message_response["success"] else "failed"
+    assistant_message = insert_dm_message(
+        session_id=session["id"],
+        contact_id=contact["id"],
+        role="assistant",
+        direction="outbound",
+        content=reply_text,
+        instagram_message_id=sent_message_id,
+        delivery_status=delivery_status,
+        error_message=None if send_message_response["success"] else send_message_response.get("error"),
+    )
+    upsert_dm_session_state(
+        session["id"],
+        summary=f"Promo lead capture inbound: {message_text}\nReply: {reply_text}",
+    )
+    touch_dm_session(session["id"])
+    upsert_meta_webhook_event(
+        event_id=(inbound_message.get("instagram_message_id") if inbound_message else None) or (inbound_message.get("id") if inbound_message else None),
+        business_id=instagram_account["business_id"],
+        instagram_account_id=instagram_account["id"],
+        event_type=event_type,
+        payload=payload,
+        processing_status=processing_status if send_message_response["success"] else "failed",
+        error_message=error_message or (None if send_message_response["success"] else send_message_response.get("error")),
+    )
+
+    return {
+        "processing_result": processing_result if send_message_response["success"] else "promo_lead_dm_send_failed",
+        "openai_result": None,
+        "send_message_response": send_message_response,
+        "db_result": {
+            "business_id": instagram_account["business_id"],
+            "instagram_account_id": instagram_account["id"],
+            "contact_id": contact["id"],
+            "session_id": session["id"],
+            "inbound_message_id": inbound_message["id"] if inbound_message else None,
+            "assistant_message_id": assistant_message["id"] if assistant_message else None,
+            "promo_lead_id": lead["id"],
+            "sms_message_id": sms_message["id"] if sms_message else None,
+        },
+    }
+
+
 def process_dm_with_database(dm_info, payload, event_type):
     account_id = dm_info["account_id"]
     sender_id = dm_info["sender_id"]
@@ -763,6 +1023,19 @@ def process_dm_with_database(dm_info, payload, event_type):
     touch_dm_session(session["id"])
 
     history = fetch_dm_history(session["id"])
+    lead_capture_result = handle_promo_lead_capture(
+        instagram_account,
+        contact,
+        session,
+        history,
+        message_text,
+        inbound_message,
+        event_type,
+        payload,
+    )
+    if lead_capture_result:
+        return lead_capture_result
+
     rag_result = retrieve_knowledge_context(instagram_account["id"], message_text)
     started_at = time.perf_counter()
     openai_result = generate_reply(
@@ -1070,6 +1343,17 @@ def process_comment_with_database(comment_info, payload, event_type):
         prefix=code_prefix,
         valid_duration_hours=post.get("promo_code_valid_duration_hours"),
     )
+    promo_lead = ensure_promo_lead(
+        instagram_account["id"],
+        post["id"],
+        contact["id"],
+        comment["id"],
+        promo_code["id"],
+        extra_metadata={
+            "matched_keyword": matched_keyword,
+            "source": "comment_to_dm",
+        },
+    )
     session = ensure_dm_session(instagram_account["id"], contact["id"])
     touch_dm_session(session["id"])
 
@@ -1080,34 +1364,12 @@ def process_comment_with_database(comment_info, payload, event_type):
     public_reply_id = get_sent_instagram_message_id(public_reply_response)
     public_error = None if public_reply_response["success"] else public_reply_response.get("error")
 
-    rag_query = "\n".join(
-        part
-        for part in [
-            post.get("dm_prompt") or "",
-            matched_keyword or "",
-            comment_text,
-        ]
-        if part
-    )
-    rag_result = retrieve_knowledge_context(instagram_account["id"], rag_query)
-    started_at = time.perf_counter()
-    openai_result = generate_reply(
-        build_comment_dm_input(post, comment_info, matched_keyword, promo_code=promo_code["code"]),
-        system_prompt=instagram_account.get("system_prompt"),
-        knowledge_context=rag_result["chunks"],
-    )
-    openai_result["reply_text"] = ensure_reply_contains_promo_code(
-        openai_result["reply_text"],
-        promo_code["code"],
-    )
-    latency_ms = int((time.perf_counter() - started_at) * 1000)
-    openai_error = openai_result.get("error") if openai_result["used_fallback"] else None
-
-    private_reply_response = send_instagram_private_reply(comment_id, openai_result["reply_text"])
+    private_reply_text = build_lead_capture_dm_text()
+    private_reply_response = send_instagram_private_reply(comment_id, private_reply_text)
     private_reply_id = get_sent_instagram_message_id(private_reply_response)
     private_error = None if private_reply_response["success"] else private_reply_response.get("error")
     delivery_status = "sent" if private_reply_response["success"] else "failed"
-    automation_errors = [error for error in [public_error, openai_error, private_error] if error]
+    automation_errors = [error for error in [public_error, private_error] if error]
     automation_error = "\n".join(automation_errors) if automation_errors else None
 
     assistant_message = insert_dm_message(
@@ -1115,12 +1377,9 @@ def process_comment_with_database(comment_info, payload, event_type):
         contact_id=contact["id"],
         role="assistant",
         direction="outbound",
-        content=openai_result["reply_text"],
+        content=private_reply_text,
         instagram_message_id=private_reply_id,
         delivery_status=delivery_status,
-        model=openai_result.get("model"),
-        token_usage=openai_result.get("token_usage"),
-        latency_ms=latency_ms,
         error_message=automation_error,
     )
 
@@ -1128,10 +1387,6 @@ def process_comment_with_database(comment_info, payload, event_type):
         automation_status = "private_reply_failed"
         processing_result = "comment_private_reply_failed"
         processing_status = "failed"
-    elif openai_error:
-        automation_status = "openai_failed"
-        processing_result = "comment_openai_failed"
-        processing_status = "processed"
     elif public_error:
         automation_status = "comment_reply_failed"
         processing_result = "comment_public_reply_failed"
@@ -1150,15 +1405,14 @@ def process_comment_with_database(comment_info, payload, event_type):
     )
     upsert_dm_session_state(
         session["id"],
-        last_response_id=openai_result.get("response_id"),
-        summary=f"Last comment: {comment_text}\nLast private reply: {openai_result['reply_text']}",
+        summary=f"Last comment: {comment_text}\nLast private reply: {private_reply_text}",
     )
     touch_dm_session(session["id"])
     log_comment_event(processing_result, processing_status, automation_error)
 
     return {
         "processing_result": processing_result,
-        "openai_result": openai_result,
+        "openai_result": None,
         "public_reply_response": public_reply_response,
         "private_reply_response": private_reply_response,
         "db_result": {
@@ -1171,13 +1425,9 @@ def process_comment_with_database(comment_info, payload, event_type):
             "assistant_message_id": assistant_message["id"] if assistant_message else None,
             "promo_code_id": promo_code["id"],
             "promo_code": promo_code["code"],
+            "promo_lead_id": promo_lead["id"],
             "promo_code_valid_from": promo_code.get("valid_from"),
             "promo_code_expires_at": promo_code.get("expires_at"),
-            "rag": {
-                "enabled": rag_result["enabled"],
-                "match_count": len(rag_result["chunks"]),
-                "error": rag_result["error"],
-            },
         },
     }
 
@@ -1492,18 +1742,18 @@ def serialize_promo_code_for_api(code_row):
     }
 
 
-def serialize_followup_for_api(followup):
-    if not followup:
+def serialize_sms_message_for_api(sms_message):
+    if not sms_message:
         return None
     return {
-        "id": followup.get("id"),
-        "promo_code_id": followup.get("promo_code_id"),
-        "status": followup.get("status"),
-        "scheduled_for": followup.get("scheduled_for"),
-        "sent_at": followup.get("sent_at"),
-        "message_tag": followup.get("message_tag"),
-        "instagram_message_id": followup.get("instagram_message_id"),
-        "error_message": followup.get("error_message"),
+        "id": sms_message.get("id"),
+        "promo_code_id": sms_message.get("promo_code_id"),
+        "purpose": sms_message.get("purpose"),
+        "status": sms_message.get("status"),
+        "scheduled_for": sms_message.get("scheduled_for"),
+        "sent_at": sms_message.get("sent_at"),
+        "twilio_message_sid": sms_message.get("twilio_message_sid"),
+        "error_message": sms_message.get("error_message"),
     }
 
 
@@ -1516,28 +1766,41 @@ def parse_iso_datetime(value):
     return parsed
 
 
-def build_promo_followup_message(promo_code):
-    return (
-        "Thanks for visiting! We hope you enjoyed your experience using "
-        f"code {promo_code['code']}. How was everything?"
-    )
+def schedule_sms_redemption_followup(promo_code):
+    existing = get_redemption_followup_sms_by_promo_code(promo_code["id"])
+    if existing:
+        return existing
 
+    lead = get_promo_lead_by_promo_code(promo_code["id"])
+    contact = get_contact_by_id(promo_code["contact_id"])
+    phone_e164 = (lead or {}).get("phone_e164") or (contact or {}).get("phone_e164")
+    if not phone_e164:
+        return None
 
-def schedule_promo_code_followup(promo_code):
     redeemed_at = parse_iso_datetime(promo_code.get("redeemed_at")) or datetime.now(timezone.utc)
     delay_minutes = parse_int_env("FOLLOWUP_DELAY_MINUTES", 10)
     scheduled_for = redeemed_at + timedelta(minutes=delay_minutes)
-    message_text = build_promo_followup_message(promo_code)
-    return ensure_promo_code_followup(
-        promo_code,
-        scheduled_for.isoformat(),
-        message_text,
-        message_tag="NOTIFICATION_MESSAGE",
-        extra_metadata={
+    sms_row = {
+        "instagram_account_id": promo_code["instagram_account_id"],
+        "contact_id": promo_code["contact_id"],
+        "promo_code_id": promo_code["id"],
+        "promo_lead_id": (lead or {}).get("id"),
+        "to_phone_e164": phone_e164,
+        "body": build_sms_followup_body(promo_code),
+        "purpose": "post_redemption_followup",
+        "status": "pending",
+        "scheduled_for": scheduled_for.isoformat(),
+        "extra_metadata": {
             "source": "promo_code_redemption",
             "followup_delay_minutes": delay_minutes,
         },
-    )
+    }
+    try:
+        return create_sms_message(sms_row)
+    except SupabaseError as exc:
+        if "ig_sms_messages_one_redemption_followup_per_code_idx" not in str(exc):
+            raise
+        return get_redemption_followup_sms_by_promo_code(promo_code["id"])
 
 
 def validate_redeem_payload(payload):
@@ -1568,11 +1831,11 @@ def is_followup_cron_authorized():
     return bool(expected_secret and provided_secret and provided_secret == expected_secret)
 
 
-def process_due_followup(followup):
-    claimed = claim_promo_code_followup(followup["id"])
+def process_due_sms_message(sms_message):
+    claimed = claim_sms_message(sms_message["id"])
     if not claimed:
         return {
-            "id": followup["id"],
+            "id": sms_message["id"],
             "status": "skipped",
             "reason": "not_pending",
         }
@@ -1582,18 +1845,10 @@ def process_due_followup(followup):
         extra_metadata = {}
 
     try:
-        contact = get_contact_by_id(claimed["contact_id"])
-        if not contact or not contact.get("instagram_user_id"):
-            raise RuntimeError("Follow-up contact is missing an Instagram user ID")
-
-        send_response = send_instagram_tagged_dm(
-            contact["instagram_user_id"],
-            claimed["message_text"],
-            claimed.get("message_tag"),
-        )
+        send_response = send_twilio_sms(claimed["to_phone_e164"], claimed["body"])
         if not send_response.get("success"):
-            error_message = send_response.get("error") or "Instagram follow-up send failed"
-            failed = mark_promo_code_followup_failed(
+            error_message = send_response.get("error") or "Twilio SMS send failed"
+            failed = mark_sms_message_failed(
                 claimed,
                 error_message,
                 extra_metadata={
@@ -1605,44 +1860,24 @@ def process_due_followup(followup):
                 "id": claimed["id"],
                 "status": "failed",
                 "error": error_message,
-                "followup": serialize_followup_for_api(failed),
+                "sms_message": serialize_sms_message_for_api(failed),
             }
 
-        instagram_message_id = get_sent_instagram_message_id(send_response)
-        persistence_error = None
-        try:
-            session = ensure_dm_session(claimed["instagram_account_id"], claimed["contact_id"])
-            insert_dm_message(
-                session["id"],
-                claimed["contact_id"],
-                role="assistant",
-                direction="outbound",
-                content=claimed["message_text"],
-                instagram_message_id=instagram_message_id,
-                delivery_status="sent",
-            )
-            touch_dm_session(session["id"])
-        except SupabaseError as exc:
-            persistence_error = str(exc)
-            logger.exception("Failed to persist promo follow-up DM %s", claimed["id"])
-
-        sent = mark_promo_code_followup_sent(
+        sent = mark_sms_message_sent(
             claimed["id"],
-            instagram_message_id=instagram_message_id,
+            twilio_message_sid=send_response.get("sid"),
             extra_metadata={
                 **extra_metadata,
                 "send_response": send_response,
-                **({"persistence_error": persistence_error} if persistence_error else {}),
             },
         )
         return {
             "id": claimed["id"],
             "status": "sent",
-            "followup": serialize_followup_for_api(sent),
-            **({"persistence_error": persistence_error} if persistence_error else {}),
+            "sms_message": serialize_sms_message_for_api(sent),
         }
     except (RuntimeError, SupabaseError) as exc:
-        failed = mark_promo_code_followup_failed(
+        failed = mark_sms_message_failed(
             claimed,
             str(exc),
             extra_metadata={
@@ -1654,7 +1889,7 @@ def process_due_followup(followup):
             "id": claimed["id"],
             "status": "failed",
             "error": str(exc),
-            "followup": serialize_followup_for_api(failed),
+            "sms_message": serialize_sms_message_for_api(failed),
         }
 
 
@@ -1667,11 +1902,11 @@ def process_due_followups_api():
 
     batch_size = parse_int_env("FOLLOWUP_BATCH_SIZE", 20)
     try:
-        due_followups = list_due_promo_code_followups(limit=batch_size)
+        due_sms_messages = list_due_sms_messages(limit=batch_size)
     except SupabaseError as exc:
         return api_error(str(exc), 500)
 
-    results = [process_due_followup(followup) for followup in due_followups]
+    results = [process_due_sms_message(sms_message) for sms_message in due_sms_messages]
     return jsonify(
         {
             "processed": len(results),
@@ -1737,7 +1972,7 @@ def redeem_promo_code_api():
             refreshed_code = get_promo_code_by_code(account["id"], redeem_input["code"]) or code_row
             result = "already_redeemed" if refreshed_code.get("status") == "redeemed" else refreshed_code.get("status")
             return jsonify({"result": result, "promo_code": serialize_promo_code_for_api(refreshed_code)})
-        followup = schedule_promo_code_followup(redeemed_code)
+        followup = schedule_sms_redemption_followup(redeemed_code)
     except SupabaseError as exc:
         return api_error(str(exc), 500)
     except ValueError as exc:
@@ -1747,7 +1982,7 @@ def redeem_promo_code_api():
         {
             "result": "redeemed",
             "promo_code": serialize_promo_code_for_api(redeemed_code),
-            "followup": serialize_followup_for_api(followup),
+            "followup": serialize_sms_message_for_api(followup),
         }
     )
 

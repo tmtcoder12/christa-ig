@@ -65,11 +65,11 @@ export type PromoCodeSummary = {
 export type PromoCodeFollowupSummary = {
   id: string;
   promo_code_id: string;
+  purpose: 'promo_code' | 'post_redemption_followup';
   status: 'pending' | 'sending' | 'sent' | 'failed' | 'cancelled';
-  scheduled_for: string;
+  scheduled_for: string | null;
   sent_at: string | null;
-  message_tag: string | null;
-  instagram_message_id: string | null;
+  twilio_message_sid: string | null;
   error_message: string | null;
 };
 

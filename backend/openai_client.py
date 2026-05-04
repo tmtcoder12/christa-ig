@@ -1,3 +1,4 @@
+import json
 import os
 
 from openai import OpenAI
@@ -9,6 +10,10 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant responding to Instagram dir
 DEFAULT_FALLBACK_MESSAGE = "Thanks for your message — I'll get back to you shortly."
 MAX_HISTORY_MESSAGES = 20
 MAX_KNOWLEDGE_CHARS_PER_CHUNK = 900
+LEAD_EXTRACTION_SYSTEM_PROMPT = (
+    "Extract customer contact information from Instagram DMs. "
+    "Return only JSON with keys customer_name and phone. Use null when missing."
+)
 
 
 def _trim_history(history):
@@ -145,4 +150,61 @@ def generate_reply(history, system_prompt=None, knowledge_context=None):
             "response_id": None,
             "token_usage": {},
             "knowledge_context_count": knowledge_context_count,
+        }
+
+
+def extract_lead_contact_info(history):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    model = os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
+    if not api_key:
+        return {
+            "success": False,
+            "customer_name": None,
+            "phone": None,
+            "error": "OPENAI_API_KEY is not set",
+            "model": model,
+            "response_id": None,
+            "token_usage": {},
+        }
+
+    client = OpenAI(api_key=api_key)
+    trimmed_history = _trim_history(history)
+    extraction_input = [
+        *trimmed_history,
+        {
+            "role": "user",
+            "content": (
+                "From the conversation above, extract the customer's name and phone number. "
+                "Return compact JSON only, for example: "
+                '{"customer_name":"Alex Kim","phone":"6045551212"}.'
+            ),
+        },
+    ]
+
+    try:
+        response = client.responses.create(
+            model=model,
+            instructions=LEAD_EXTRACTION_SYSTEM_PROMPT,
+            input=extraction_input,
+        )
+        raw_text = (response.output_text or "").strip()
+        parsed = json.loads(raw_text)
+        return {
+            "success": True,
+            "customer_name": parsed.get("customer_name") if isinstance(parsed, dict) else None,
+            "phone": parsed.get("phone") if isinstance(parsed, dict) else None,
+            "error": None,
+            "model": model,
+            "response_id": getattr(response, "id", None),
+            "token_usage": _serialize_usage(response),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "customer_name": None,
+            "phone": None,
+            "error": str(exc),
+            "model": model,
+            "response_id": None,
+            "token_usage": {},
         }

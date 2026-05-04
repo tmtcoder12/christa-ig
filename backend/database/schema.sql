@@ -162,6 +162,9 @@ create table if not exists public.ig_contacts (
   instagram_user_id text not null,
   username text,
   display_name text,
+  phone_raw text,
+  phone_e164 text,
+  sms_consent_at timestamp with time zone,
   profile_picture_url text,
   first_seen_at timestamp with time zone not null default now(),
   last_seen_at timestamp with time zone not null default now(),
@@ -398,6 +401,57 @@ create table if not exists public.ig_promo_code_followups (
   constraint ig_promo_code_followups_promo_code_key unique (promo_code_id)
 );
 
+create table if not exists public.ig_promo_leads (
+  id uuid primary key default gen_random_uuid(),
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  post_id uuid not null references public.ig_posts(id) on delete cascade,
+  contact_id uuid not null references public.ig_contacts(id) on delete cascade,
+  comment_id uuid references public.ig_comments(id) on delete set null,
+  promo_code_id uuid not null references public.ig_promo_codes(id) on delete cascade,
+  customer_name text,
+  phone_raw text,
+  phone_e164 text,
+  sms_consent_at timestamp with time zone,
+  status text not null default 'collecting' check (
+    status = any (array['collecting', 'ready', 'code_sms_sent', 'code_sms_failed', 'cancelled'])
+  ),
+  error_message text,
+  extra_metadata jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  foreign key (post_id, instagram_account_id)
+    references public.ig_posts(id, instagram_account_id)
+    on delete cascade,
+  foreign key (contact_id, instagram_account_id)
+    references public.ig_contacts(id, instagram_account_id)
+    on delete cascade,
+  constraint ig_promo_leads_promo_code_key unique (promo_code_id)
+);
+
+create table if not exists public.ig_sms_messages (
+  id uuid primary key default gen_random_uuid(),
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  contact_id uuid references public.ig_contacts(id) on delete set null,
+  promo_code_id uuid references public.ig_promo_codes(id) on delete set null,
+  promo_lead_id uuid references public.ig_promo_leads(id) on delete set null,
+  to_phone_e164 text not null,
+  body text not null,
+  purpose text not null check (
+    purpose = any (array['promo_code', 'post_redemption_followup'])
+  ),
+  status text not null default 'pending' check (
+    status = any (array['pending', 'sending', 'sent', 'failed', 'cancelled'])
+  ),
+  scheduled_for timestamp with time zone,
+  sent_at timestamp with time zone,
+  twilio_message_sid text,
+  error_message text,
+  attempt_count integer not null default 0 check (attempt_count >= 0),
+  extra_metadata jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now()
+);
+
 create table if not exists public.ig_comment_classifications (
   id uuid primary key default gen_random_uuid(),
   comment_id uuid not null references public.ig_comments(id) on delete cascade,
@@ -468,6 +522,10 @@ create index if not exists instagram_accounts_business_idx
 create index if not exists ig_contacts_account_user_idx
   on public.ig_contacts (instagram_account_id, instagram_user_id);
 
+create index if not exists ig_contacts_phone_e164_idx
+  on public.ig_contacts (phone_e164)
+  where phone_e164 is not null;
+
 create index if not exists ig_dm_sessions_account_contact_activity_idx
   on public.ig_dm_sessions (instagram_account_id, contact_id, last_activity_at desc);
 
@@ -535,6 +593,26 @@ create index if not exists ig_promo_code_followups_account_created_idx
 
 create index if not exists ig_promo_code_followups_contact_created_idx
   on public.ig_promo_code_followups (contact_id, created_at desc);
+
+create index if not exists ig_promo_leads_contact_status_idx
+  on public.ig_promo_leads (contact_id, status, created_at desc);
+
+create index if not exists ig_promo_leads_account_created_idx
+  on public.ig_promo_leads (instagram_account_id, created_at desc);
+
+create index if not exists ig_sms_messages_status_scheduled_idx
+  on public.ig_sms_messages (status, scheduled_for);
+
+create index if not exists ig_sms_messages_account_created_idx
+  on public.ig_sms_messages (instagram_account_id, created_at desc);
+
+create index if not exists ig_sms_messages_promo_code_idx
+  on public.ig_sms_messages (promo_code_id);
+
+create unique index if not exists ig_sms_messages_one_redemption_followup_per_code_idx
+  on public.ig_sms_messages (promo_code_id)
+  where purpose = 'post_redemption_followup'
+    and promo_code_id is not null;
 
 create index if not exists ig_comment_classifications_comment_classified_idx
   on public.ig_comment_classifications (comment_id, classified_at desc);
@@ -648,6 +726,14 @@ create trigger set_ig_promo_code_followups_updated_at
 before update on public.ig_promo_code_followups
 for each row execute function public.set_updated_at();
 
+create trigger set_ig_promo_leads_updated_at
+before update on public.ig_promo_leads
+for each row execute function public.set_updated_at();
+
+create trigger set_ig_sms_messages_updated_at
+before update on public.ig_sms_messages
+for each row execute function public.set_updated_at();
+
 create or replace function public.current_user_business_role(target_business_id uuid)
 returns text
 language sql
@@ -733,6 +819,8 @@ alter table public.ig_promotion_setups enable row level security;
 alter table public.ig_comments enable row level security;
 alter table public.ig_promo_codes enable row level security;
 alter table public.ig_promo_code_followups enable row level security;
+alter table public.ig_promo_leads enable row level security;
+alter table public.ig_sms_messages enable row level security;
 alter table public.ig_comment_classifications enable row level security;
 alter table public.meta_webhook_events enable row level security;
 
@@ -757,6 +845,8 @@ grant select on public.ig_promotion_setups to authenticated;
 grant select on public.ig_comments to authenticated;
 grant select on public.ig_promo_codes to authenticated;
 grant select on public.ig_promo_code_followups to authenticated;
+grant select on public.ig_promo_leads to authenticated;
+grant select on public.ig_sms_messages to authenticated;
 grant select on public.ig_comment_classifications to authenticated;
 grant select on public.meta_webhook_events to authenticated;
 grant select on public.latest_ig_comment_classifications to authenticated;
@@ -1012,6 +1102,30 @@ using (
     select 1
     from public.instagram_accounts ia
     where ia.id = ig_promo_code_followups.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ig promo leads select members"
+on public.ig_promo_leads for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ig_promo_leads.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ig sms messages select members"
+on public.ig_sms_messages for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ig_sms_messages.instagram_account_id
       and public.user_has_business_access(ia.business_id)
   )
 );
