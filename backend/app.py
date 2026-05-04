@@ -472,6 +472,38 @@ def fetch_instagram_media(instagram_user_id):
     return media if isinstance(media, list) else []
 
 
+def fetch_instagram_media_item(media_id):
+    access_token = os.environ.get("INSTAGRAM_ACCESS_TOKEN")
+    if not access_token:
+        raise RuntimeError("INSTAGRAM_ACCESS_TOKEN is not set")
+
+    query = urllib.parse.urlencode(
+        {
+            "fields": "id,caption,media_type,media_url,permalink,timestamp",
+        }
+    )
+    api_request = urllib.request.Request(
+        f"https://graph.instagram.com/v24.0/{media_id}?{query}",
+        headers={
+            "Authorization": f"Bearer {access_token}",
+            "Accept": "application/json",
+        },
+        method="GET",
+    )
+    try:
+        with urllib.request.urlopen(api_request, timeout=10) as response:
+            media_item = json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        error_body = exc.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"Instagram media item fetch failed: {exc.code} {error_body}") from exc
+    except (urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Instagram media item fetch failed: {exc}") from exc
+
+    if not isinstance(media_item, dict) or not media_item.get("id"):
+        raise RuntimeError("Instagram media item fetch returned no media ID")
+    return media_item
+
+
 def parse_meta_media_timestamp(value):
     if not value:
         return None
@@ -867,20 +899,38 @@ def process_comment_with_database(comment_info, payload, event_type):
             },
         }
 
+    discovered_unknown_post = False
     post = get_instagram_post(instagram_account["id"], media_id)
     if not post:
-        processing_result = log_comment_event("instagram_post_not_configured")
-        return {
-            "processing_result": processing_result,
-            "openai_result": None,
-            "public_reply_response": None,
-            "private_reply_response": None,
-            "db_result": {
-                "instagram_account_id": instagram_account["id"],
-                "instagram_media_id": media_id,
-                "instagram_comment_id": comment_id,
-            },
-        }
+        discovered_post = None
+        try:
+            media_item = fetch_instagram_media_item(media_id)
+            discovered_post = upsert_instagram_post(
+                build_regular_post_row(
+                    instagram_account["id"],
+                    media_item,
+                    source="comment_webhook_media_discovery",
+                )
+            )
+        except RuntimeError as exc:
+            logger.warning("Unable to discover Instagram media %s from comment webhook: %s", media_id, exc)
+
+        if discovered_post:
+            post = discovered_post
+            discovered_unknown_post = True
+        else:
+            processing_result = log_comment_event("instagram_post_not_configured")
+            return {
+                "processing_result": processing_result,
+                "openai_result": None,
+                "public_reply_response": None,
+                "private_reply_response": None,
+                "db_result": {
+                    "instagram_account_id": instagram_account["id"],
+                    "instagram_media_id": media_id,
+                    "instagram_comment_id": comment_id,
+                },
+            }
 
     if not commenter_id:
         comment = upsert_comment(
@@ -924,7 +974,10 @@ def process_comment_with_database(comment_info, payload, event_type):
 
     if post.get("post_type") != "promotional" or not post.get("automation_enabled"):
         comment = upsert_comment(**base_comment_kwargs)
-        processing_result = log_comment_event("comment_automation_not_applicable")
+        processing_result = log_comment_event(
+            "comment_unknown_media_discovered" if discovered_unknown_post else "comment_automation_not_applicable",
+            processing_status="processed" if discovered_unknown_post else "ignored",
+        )
         return {
             "processing_result": processing_result,
             "openai_result": None,
@@ -934,6 +987,8 @@ def process_comment_with_database(comment_info, payload, event_type):
                 "instagram_account_id": instagram_account["id"],
                 "post_id": post["id"],
                 "comment_id": comment["id"] if comment else None,
+                "discovered_post": discovered_unknown_post,
+                "instagram_media_id": media_id,
             },
         }
 
