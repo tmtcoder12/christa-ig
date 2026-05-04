@@ -62,6 +62,17 @@ export type PromoCodeSummary = {
   redeemed_at: string | null;
 };
 
+export type PromoCodeFollowupSummary = {
+  id: string;
+  promo_code_id: string;
+  status: 'pending' | 'sending' | 'sent' | 'failed' | 'cancelled';
+  scheduled_for: string;
+  sent_at: string | null;
+  message_tag: string | null;
+  instagram_message_id: string | null;
+  error_message: string | null;
+};
+
 export type RedeemPromoCodeInput = {
   instagram_account_id: string;
   code: string;
@@ -70,6 +81,7 @@ export type RedeemPromoCodeInput = {
 export type RedeemPromoCodeResponse = {
   result: PromoCodeRedeemResult;
   promo_code: PromoCodeSummary | null;
+  followup?: PromoCodeFollowupSummary | null;
 };
 
 export type KnowledgeChunk = {

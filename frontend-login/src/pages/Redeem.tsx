@@ -150,6 +150,12 @@ export function Redeem() {
               <dt>Redeemed</dt>
               <dd>{formatTimestamp(result.promo_code?.redeemed_at)}</dd>
             </div>
+            {result.followup ? (
+              <div>
+                <dt>Follow-up</dt>
+                <dd>{formatTimestamp(result.followup.scheduled_for)}</dd>
+              </div>
+            ) : null}
           </dl>
         </section>
       ) : null}

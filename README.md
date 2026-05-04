@@ -33,6 +33,9 @@ For `comment-related` webhook events, promotional posts can be configured with t
 - `OPENAI_FALLBACK_MESSAGE` optionally overrides the fallback reply used when OpenAI fails.
 - `RAG_ENABLED` optionally enables or disables knowledge retrieval. Defaults to `true`.
 - `RAG_MATCH_COUNT` optionally sets how many knowledge chunks are sent to OpenAI. Defaults to `5`.
+- `FOLLOWUP_CRON_SECRET` protects the follow-up processor endpoint.
+- `FOLLOWUP_DELAY_MINUTES` optionally sets the delay between promo-code redemption and the follow-up DM. Defaults to `10`.
+- `FOLLOWUP_BATCH_SIZE` optionally sets how many due follow-ups one processor call handles. Defaults to `20`.
 - `PORT` is provided by Render automatically.
 
 The `frontend-login` Vite app also uses browser-safe frontend env vars:
@@ -142,6 +145,17 @@ Promo code validity is controlled by `promo_code_valid_duration_hours` on the po
 - Reused codes keep their original `valid_from` and `expires_at`; changing the post duration later does not rewrite already-issued codes.
 - Expiration is checked from `ig_promo_codes.expires_at`; when webhook traffic is processed, issued codes with `expires_at < now()` are marked `expired`.
 - `status = 'expired'` means the validity window has passed; `redeemed` means the code was used; `void` means an admin/manual flow invalidated it.
+
+When a staff user redeems a promo code through the `frontend-login` Redeem page, the backend creates one durable `ig_promo_code_followups` row for that promo code. By default, the follow-up is scheduled for 10 minutes after `ig_promo_codes.redeemed_at`, uses the static post-purchase message text, and is sent with the configured `POST_PURCHASE_UPDATE` message tag.
+
+Follow-ups are not sent by an in-memory timer. Run the due-message processor from a cron service such as Render Cron or Supabase cron:
+
+```bash
+curl -X POST https://YOUR_BACKEND_HOST/api/followups/process-due \
+  -H "X-Followup-Cron-Secret: YOUR_FOLLOWUP_CRON_SECRET"
+```
+
+The processor finds pending rows with `scheduled_for <= now()`, sends the Instagram DM, records the outbound DM in `ig_dm_messages` when possible, then marks the follow-up `sent` or `failed`.
 
 The `frontend-login` Add Promotion page creates a pending `ig_promotion_setups` row through `POST /api/promotions`. The backend snapshots the selected account's existing `ig_posts.instagram_media_id` values, polls Instagram media every 30 seconds for up to 5 minutes, and turns the newest unseen media item into a promotional `ig_posts` row. Only one pending/polling setup can exist per Instagram account.
 

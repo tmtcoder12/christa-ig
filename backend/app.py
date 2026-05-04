@@ -18,8 +18,10 @@ from supabase_client import (
     ensure_dm_session,
     expire_expired_promo_codes,
     ensure_promo_code,
+    ensure_promo_code_followup,
     fetch_dm_history,
     get_comment_by_instagram_id,
+    get_contact_by_id,
     get_instagram_account,
     get_instagram_account_by_id,
     get_instagram_post,
@@ -31,12 +33,16 @@ from supabase_client import (
     is_configured as is_supabase_configured,
     is_promo_code_valid,
     iso_from_meta_timestamp,
+    list_due_promo_code_followups,
     list_knowledge_chunk_filter_values,
     list_knowledge_chunks,
     list_instagram_post_media_ids,
+    mark_promo_code_followup_failed,
+    mark_promo_code_followup_sent,
     match_knowledge_chunks,
     message_exists,
     redeem_promo_code,
+    claim_promo_code_followup,
     touch_dm_session,
     update_comment_automation,
     update_promotion_setup,
@@ -76,7 +82,7 @@ def add_api_cors_headers(response):
     if origin and origin.rstrip("/") in get_allowed_frontend_origins():
         response.headers["Access-Control-Allow-Origin"] = origin
         response.headers["Vary"] = "Origin"
-    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type"
+    response.headers["Access-Control-Allow-Headers"] = "Authorization, Content-Type, X-Followup-Cron-Secret"
     response.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
     return response
 
@@ -1234,6 +1240,16 @@ def send_instagram_dm(recipient_id, text):
     )
 
 
+def send_instagram_tagged_dm(recipient_id, text, tag):
+    body = {
+        "recipient": {"id": recipient_id},
+        "message": {"text": text},
+    }
+    if tag:
+        body["tag"] = tag
+    return send_instagram_api_request(INSTAGRAM_SEND_MESSAGE_URL, body)
+
+
 def send_instagram_private_reply(comment_id, text):
     return send_instagram_api_request(
         INSTAGRAM_SEND_MESSAGE_URL,
@@ -1280,6 +1296,7 @@ def verify_webhook():
 @app.route("/api/promotions/<setup_id>", methods=["OPTIONS"])
 @app.route("/api/promo-codes/redeem", methods=["OPTIONS"])
 @app.route("/api/knowledge-chunks", methods=["OPTIONS"])
+@app.route("/api/followups/process-due", methods=["OPTIONS"])
 def promotion_api_options(setup_id=None):
     return "", 204
 
@@ -1475,6 +1492,54 @@ def serialize_promo_code_for_api(code_row):
     }
 
 
+def serialize_followup_for_api(followup):
+    if not followup:
+        return None
+    return {
+        "id": followup.get("id"),
+        "promo_code_id": followup.get("promo_code_id"),
+        "status": followup.get("status"),
+        "scheduled_for": followup.get("scheduled_for"),
+        "sent_at": followup.get("sent_at"),
+        "message_tag": followup.get("message_tag"),
+        "instagram_message_id": followup.get("instagram_message_id"),
+        "error_message": followup.get("error_message"),
+    }
+
+
+def parse_iso_datetime(value):
+    if not value:
+        return None
+    parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def build_promo_followup_message(promo_code):
+    return (
+        "Thanks for visiting! We hope you enjoyed your experience using "
+        f"code {promo_code['code']}. How was everything?"
+    )
+
+
+def schedule_promo_code_followup(promo_code):
+    redeemed_at = parse_iso_datetime(promo_code.get("redeemed_at")) or datetime.now(timezone.utc)
+    delay_minutes = parse_int_env("FOLLOWUP_DELAY_MINUTES", 10)
+    scheduled_for = redeemed_at + timedelta(minutes=delay_minutes)
+    message_text = build_promo_followup_message(promo_code)
+    return ensure_promo_code_followup(
+        promo_code,
+        scheduled_for.isoformat(),
+        message_text,
+        message_tag="POST_PURCHASE_UPDATE",
+        extra_metadata={
+            "source": "promo_code_redemption",
+            "followup_delay_minutes": delay_minutes,
+        },
+    )
+
+
 def validate_redeem_payload(payload):
     if not isinstance(payload, dict):
         raise ValueError("Request body must be a JSON object")
@@ -1491,6 +1556,128 @@ def validate_redeem_payload(payload):
         "instagram_account_id": instagram_account_id,
         "code": code,
     }
+
+
+def get_followup_cron_secret():
+    return os.environ.get("FOLLOWUP_CRON_SECRET", "").strip()
+
+
+def is_followup_cron_authorized():
+    expected_secret = get_followup_cron_secret()
+    provided_secret = request.headers.get("X-Followup-Cron-Secret", "").strip()
+    return bool(expected_secret and provided_secret and provided_secret == expected_secret)
+
+
+def process_due_followup(followup):
+    claimed = claim_promo_code_followup(followup["id"])
+    if not claimed:
+        return {
+            "id": followup["id"],
+            "status": "skipped",
+            "reason": "not_pending",
+        }
+
+    extra_metadata = claimed.get("extra_metadata") or {}
+    if not isinstance(extra_metadata, dict):
+        extra_metadata = {}
+
+    try:
+        contact = get_contact_by_id(claimed["contact_id"])
+        if not contact or not contact.get("instagram_user_id"):
+            raise RuntimeError("Follow-up contact is missing an Instagram user ID")
+
+        send_response = send_instagram_tagged_dm(
+            contact["instagram_user_id"],
+            claimed["message_text"],
+            claimed.get("message_tag"),
+        )
+        if not send_response.get("success"):
+            error_message = send_response.get("error") or "Instagram follow-up send failed"
+            failed = mark_promo_code_followup_failed(
+                claimed,
+                error_message,
+                extra_metadata={
+                    **extra_metadata,
+                    "send_response": send_response,
+                },
+            )
+            return {
+                "id": claimed["id"],
+                "status": "failed",
+                "error": error_message,
+                "followup": serialize_followup_for_api(failed),
+            }
+
+        instagram_message_id = get_sent_instagram_message_id(send_response)
+        persistence_error = None
+        try:
+            session = ensure_dm_session(claimed["instagram_account_id"], claimed["contact_id"])
+            insert_dm_message(
+                session["id"],
+                claimed["contact_id"],
+                role="assistant",
+                direction="outbound",
+                content=claimed["message_text"],
+                instagram_message_id=instagram_message_id,
+                delivery_status="sent",
+            )
+            touch_dm_session(session["id"])
+        except SupabaseError as exc:
+            persistence_error = str(exc)
+            logger.exception("Failed to persist promo follow-up DM %s", claimed["id"])
+
+        sent = mark_promo_code_followup_sent(
+            claimed["id"],
+            instagram_message_id=instagram_message_id,
+            extra_metadata={
+                **extra_metadata,
+                "send_response": send_response,
+                **({"persistence_error": persistence_error} if persistence_error else {}),
+            },
+        )
+        return {
+            "id": claimed["id"],
+            "status": "sent",
+            "followup": serialize_followup_for_api(sent),
+            **({"persistence_error": persistence_error} if persistence_error else {}),
+        }
+    except (RuntimeError, SupabaseError) as exc:
+        failed = mark_promo_code_followup_failed(
+            claimed,
+            str(exc),
+            extra_metadata={
+                **extra_metadata,
+                "processor_error": str(exc),
+            },
+        )
+        return {
+            "id": claimed["id"],
+            "status": "failed",
+            "error": str(exc),
+            "followup": serialize_followup_for_api(failed),
+        }
+
+
+@app.post("/api/followups/process-due")
+def process_due_followups_api():
+    if not is_followup_cron_authorized():
+        return api_error("Unauthorized", 401)
+    if not is_supabase_configured():
+        return api_error("Supabase is not configured", 500)
+
+    batch_size = parse_int_env("FOLLOWUP_BATCH_SIZE", 20)
+    try:
+        due_followups = list_due_promo_code_followups(limit=batch_size)
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    results = [process_due_followup(followup) for followup in due_followups]
+    return jsonify(
+        {
+            "processed": len(results),
+            "results": results,
+        }
+    )
 
 
 @app.post("/api/promo-codes/redeem")
@@ -1550,10 +1737,19 @@ def redeem_promo_code_api():
             refreshed_code = get_promo_code_by_code(account["id"], redeem_input["code"]) or code_row
             result = "already_redeemed" if refreshed_code.get("status") == "redeemed" else refreshed_code.get("status")
             return jsonify({"result": result, "promo_code": serialize_promo_code_for_api(refreshed_code)})
+        followup = schedule_promo_code_followup(redeemed_code)
     except SupabaseError as exc:
         return api_error(str(exc), 500)
+    except ValueError as exc:
+        return api_error(str(exc), 500)
 
-    return jsonify({"result": "redeemed", "promo_code": serialize_promo_code_for_api(redeemed_code)})
+    return jsonify(
+        {
+            "result": "redeemed",
+            "promo_code": serialize_promo_code_for_api(redeemed_code),
+            "followup": serialize_followup_for_api(followup),
+        }
+    )
 
 
 @app.post("/api/promotions")

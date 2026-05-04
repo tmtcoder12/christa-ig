@@ -24,6 +24,11 @@ KNOWLEDGE_CHUNK_SELECT = (
     "id,instagram_account_id,text,type,source_url,page_path,title,"
     "meta_description,extra_metadata,content_hash,created_at"
 )
+PROMO_CODE_FOLLOWUP_SELECT = (
+    "id,promo_code_id,instagram_account_id,contact_id,scheduled_for,sent_at,status,"
+    "message_text,message_tag,instagram_message_id,error_message,attempt_count,"
+    "extra_metadata,created_at,updated_at"
+)
 
 
 class SupabaseError(Exception):
@@ -378,6 +383,19 @@ def get_promo_code_by_code(instagram_account_id, code):
     )
 
 
+def get_promo_code_by_id(promo_code_id):
+    return _fetch_one(
+        "ig_promo_codes",
+        {
+            "id": f"eq.{promo_code_id}",
+            "select": (
+                "id,instagram_account_id,post_id,contact_id,comment_id,code,status,"
+                "valid_from,expires_at,redeemed_at,extra_metadata,created_at,updated_at"
+            ),
+        },
+    )
+
+
 def redeem_promo_code(promo_code_id, redeemed_by=None):
     now = datetime.now(timezone.utc).isoformat()
     existing = _fetch_one(
@@ -413,6 +431,122 @@ def redeem_promo_code(promo_code_id, redeemed_by=None):
         },
     )
     return rows[0] if rows else None
+
+
+def ensure_promo_code_followup(
+    promo_code,
+    scheduled_for,
+    message_text,
+    message_tag="POST_PURCHASE_UPDATE",
+    extra_metadata=None,
+):
+    existing = _fetch_one(
+        "ig_promo_code_followups",
+        {
+            "promo_code_id": f"eq.{promo_code['id']}",
+            "select": PROMO_CODE_FOLLOWUP_SELECT,
+        },
+    )
+    if existing:
+        return existing
+
+    row = {
+        "promo_code_id": promo_code["id"],
+        "instagram_account_id": promo_code["instagram_account_id"],
+        "contact_id": promo_code["contact_id"],
+        "scheduled_for": scheduled_for,
+        "message_text": message_text,
+        "message_tag": message_tag,
+        "status": "pending",
+        "extra_metadata": extra_metadata or {},
+    }
+    try:
+        return _insert("ig_promo_code_followups", row)
+    except SupabaseError as exc:
+        if "ig_promo_code_followups_promo_code_key" not in str(exc):
+            raise
+        return _fetch_one(
+            "ig_promo_code_followups",
+            {
+                "promo_code_id": f"eq.{promo_code['id']}",
+                "select": PROMO_CODE_FOLLOWUP_SELECT,
+            },
+        )
+
+
+def list_due_promo_code_followups(now=None, limit=20):
+    now = now or datetime.now(timezone.utc)
+    rows = _request(
+        "GET",
+        "ig_promo_code_followups",
+        params={
+            "status": "eq.pending",
+            "scheduled_for": f"lte.{now.isoformat()}",
+            "select": PROMO_CODE_FOLLOWUP_SELECT,
+            "order": "scheduled_for.asc",
+            "limit": str(limit),
+        },
+    )
+    return rows or []
+
+
+def claim_promo_code_followup(followup_id):
+    rows = _patch_returning(
+        "ig_promo_code_followups",
+        {
+            "id": f"eq.{followup_id}",
+            "status": "eq.pending",
+            "select": PROMO_CODE_FOLLOWUP_SELECT,
+        },
+        {"status": "sending"},
+    )
+    return rows[0] if rows else None
+
+
+def mark_promo_code_followup_sent(followup_id, instagram_message_id=None, extra_metadata=None):
+    patch = {
+        "status": "sent",
+        "sent_at": datetime.now(timezone.utc).isoformat(),
+        "error_message": None,
+    }
+    if instagram_message_id:
+        patch["instagram_message_id"] = instagram_message_id
+    if extra_metadata is not None:
+        patch["extra_metadata"] = extra_metadata
+
+    rows = _patch_returning(
+        "ig_promo_code_followups",
+        {"id": f"eq.{followup_id}", "select": PROMO_CODE_FOLLOWUP_SELECT},
+        patch,
+    )
+    return rows[0] if rows else None
+
+
+def mark_promo_code_followup_failed(followup, error_message, extra_metadata=None):
+    patch = {
+        "status": "failed",
+        "error_message": error_message,
+        "attempt_count": int(followup.get("attempt_count") or 0) + 1,
+    }
+    if extra_metadata is not None:
+        patch["extra_metadata"] = extra_metadata
+
+    rows = _patch_returning(
+        "ig_promo_code_followups",
+        {"id": f"eq.{followup['id']}", "select": PROMO_CODE_FOLLOWUP_SELECT},
+        patch,
+    )
+    return rows[0] if rows else None
+
+
+def get_contact_by_id(contact_id):
+    return _fetch_one(
+        "ig_contacts",
+        {
+            "id": f"eq.{contact_id}",
+            "select": "id,instagram_account_id,instagram_user_id,username",
+        },
+    )
 
 
 def get_instagram_post(instagram_account_id, instagram_media_id):

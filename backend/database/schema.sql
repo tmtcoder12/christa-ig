@@ -374,6 +374,30 @@ create table if not exists public.ig_promo_codes (
   constraint ig_promo_codes_account_code_key unique (instagram_account_id, code)
 );
 
+create table if not exists public.ig_promo_code_followups (
+  id uuid primary key default gen_random_uuid(),
+  promo_code_id uuid not null references public.ig_promo_codes(id) on delete cascade,
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  contact_id uuid not null references public.ig_contacts(id) on delete cascade,
+  scheduled_for timestamp with time zone not null,
+  sent_at timestamp with time zone,
+  status text not null default 'pending' check (
+    status = any (array['pending', 'sending', 'sent', 'failed', 'cancelled'])
+  ),
+  message_text text not null,
+  message_tag text not null default 'POST_PURCHASE_UPDATE',
+  instagram_message_id text,
+  error_message text,
+  attempt_count integer not null default 0 check (attempt_count >= 0),
+  extra_metadata jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  foreign key (contact_id, instagram_account_id)
+    references public.ig_contacts(id, instagram_account_id)
+    on delete cascade,
+  constraint ig_promo_code_followups_promo_code_key unique (promo_code_id)
+);
+
 create table if not exists public.ig_comment_classifications (
   id uuid primary key default gen_random_uuid(),
   comment_id uuid not null references public.ig_comments(id) on delete cascade,
@@ -503,6 +527,15 @@ create index if not exists ig_promo_codes_expires_at_idx
   on public.ig_promo_codes (expires_at)
   where expires_at is not null;
 
+create index if not exists ig_promo_code_followups_status_scheduled_idx
+  on public.ig_promo_code_followups (status, scheduled_for);
+
+create index if not exists ig_promo_code_followups_account_created_idx
+  on public.ig_promo_code_followups (instagram_account_id, created_at desc);
+
+create index if not exists ig_promo_code_followups_contact_created_idx
+  on public.ig_promo_code_followups (contact_id, created_at desc);
+
 create index if not exists ig_comment_classifications_comment_classified_idx
   on public.ig_comment_classifications (comment_id, classified_at desc);
 
@@ -611,6 +644,10 @@ create trigger set_ig_promo_codes_updated_at
 before update on public.ig_promo_codes
 for each row execute function public.set_updated_at();
 
+create trigger set_ig_promo_code_followups_updated_at
+before update on public.ig_promo_code_followups
+for each row execute function public.set_updated_at();
+
 create or replace function public.current_user_business_role(target_business_id uuid)
 returns text
 language sql
@@ -695,6 +732,7 @@ alter table public.ig_posts enable row level security;
 alter table public.ig_promotion_setups enable row level security;
 alter table public.ig_comments enable row level security;
 alter table public.ig_promo_codes enable row level security;
+alter table public.ig_promo_code_followups enable row level security;
 alter table public.ig_comment_classifications enable row level security;
 alter table public.meta_webhook_events enable row level security;
 
@@ -718,6 +756,7 @@ grant select on public.ig_posts to authenticated;
 grant select on public.ig_promotion_setups to authenticated;
 grant select on public.ig_comments to authenticated;
 grant select on public.ig_promo_codes to authenticated;
+grant select on public.ig_promo_code_followups to authenticated;
 grant select on public.ig_comment_classifications to authenticated;
 grant select on public.meta_webhook_events to authenticated;
 grant select on public.latest_ig_comment_classifications to authenticated;
@@ -961,6 +1000,18 @@ using (
     select 1
     from public.instagram_accounts ia
     where ia.id = ig_promo_codes.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ig promo code followups select members"
+on public.ig_promo_code_followups for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ig_promo_code_followups.instagram_account_id
       and public.user_has_business_access(ia.business_id)
   )
 );
