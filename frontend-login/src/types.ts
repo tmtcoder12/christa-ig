@@ -71,3 +71,26 @@ export type RedeemPromoCodeResponse = {
   result: PromoCodeRedeemResult;
   promo_code: PromoCodeSummary | null;
 };
+
+export type KnowledgeChunk = {
+  id: string;
+  instagram_account_id: string;
+  text: string;
+  type: string | null;
+  source_url: string | null;
+  page_path: string | null;
+  title: string | null;
+  meta_description: string | null;
+  extra_metadata: Record<string, unknown>;
+  content_hash: string | null;
+  created_at: string;
+};
+
+export type CreateKnowledgeChunkInput = {
+  instagram_account_id: string;
+  text: string;
+  title: string | null;
+  type: string | null;
+  source_url: string | null;
+  page_path: string | null;
+};

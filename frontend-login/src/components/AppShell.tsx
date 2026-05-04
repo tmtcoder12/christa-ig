@@ -81,6 +81,7 @@ function ShellContent() {
           <nav>
             <NavLink to="/redeem">Redeem</NavLink>
             <NavLink to="/add-promotion">Add Promotion</NavLink>
+            <NavLink to="/knowledge">Knowledge</NavLink>
           </nav>
         </aside>
 

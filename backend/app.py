@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -26,9 +27,11 @@ from supabase_client import (
     get_promotion_setup,
     has_prior_comment_automation,
     insert_dm_message,
+    insert_knowledge_chunk,
     is_configured as is_supabase_configured,
     is_promo_code_valid,
     iso_from_meta_timestamp,
+    list_knowledge_chunks,
     list_instagram_post_media_ids,
     match_knowledge_chunks,
     message_exists,
@@ -1275,8 +1278,142 @@ def verify_webhook():
 @app.route("/api/promotions", methods=["OPTIONS"])
 @app.route("/api/promotions/<setup_id>", methods=["OPTIONS"])
 @app.route("/api/promo-codes/redeem", methods=["OPTIONS"])
+@app.route("/api/knowledge-chunks", methods=["OPTIONS"])
 def promotion_api_options(setup_id=None):
     return "", 204
+
+
+def serialize_knowledge_chunk_for_api(chunk):
+    if not chunk:
+        return None
+    return {
+        "id": chunk.get("id"),
+        "instagram_account_id": chunk.get("instagram_account_id"),
+        "text": chunk.get("text"),
+        "type": chunk.get("type"),
+        "source_url": chunk.get("source_url"),
+        "page_path": chunk.get("page_path"),
+        "title": chunk.get("title"),
+        "meta_description": chunk.get("meta_description"),
+        "extra_metadata": chunk.get("extra_metadata") or {},
+        "content_hash": chunk.get("content_hash"),
+        "created_at": chunk.get("created_at"),
+    }
+
+
+def clean_optional_string(value):
+    if value in (None, ""):
+        return None
+    cleaned = str(value).strip()
+    return cleaned or None
+
+
+def validate_knowledge_chunk_payload(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("Request body must be a JSON object")
+
+    instagram_account_id = str(payload.get("instagram_account_id") or "").strip()
+    if not instagram_account_id:
+        raise ValueError("instagram_account_id is required")
+
+    text = str(payload.get("text") or "").strip()
+    if not text:
+        raise ValueError("text is required")
+
+    return {
+        "instagram_account_id": instagram_account_id,
+        "text": text,
+        "title": clean_optional_string(payload.get("title")),
+        "type": clean_optional_string(payload.get("type")),
+        "source_url": clean_optional_string(payload.get("source_url")),
+        "page_path": clean_optional_string(payload.get("page_path")),
+    }
+
+
+@app.get("/api/knowledge-chunks")
+def get_knowledge_chunks_api():
+    if not is_supabase_configured():
+        return api_error("Supabase is not configured", 500)
+
+    try:
+        user = get_authenticated_api_user()
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    if not user or not user.get("id"):
+        return api_error("Unauthorized", 401)
+
+    instagram_account_id = str(request.args.get("instagram_account_id") or "").strip()
+    if not instagram_account_id:
+        return api_error("instagram_account_id is required", 400)
+
+    try:
+        account = user_has_instagram_account_access(user["id"], instagram_account_id)
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+    if not account:
+        return api_error("You do not have access to this Instagram account", 403)
+
+    try:
+        chunks = list_knowledge_chunks(account["id"])
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    return jsonify({"chunks": [serialize_knowledge_chunk_for_api(chunk) for chunk in chunks]})
+
+
+@app.post("/api/knowledge-chunks")
+def create_knowledge_chunk_api():
+    if not is_supabase_configured():
+        return api_error("Supabase is not configured", 500)
+
+    try:
+        user = get_authenticated_api_user()
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    if not user or not user.get("id"):
+        return api_error("Unauthorized", 401)
+
+    try:
+        chunk_input = validate_knowledge_chunk_payload(request.get_json(silent=True))
+    except ValueError as exc:
+        return api_error(str(exc), 400)
+
+    try:
+        account = user_has_instagram_account_access(user["id"], chunk_input["instagram_account_id"])
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+    if not account:
+        return api_error("You do not have access to this Instagram account", 403)
+
+    try:
+        embedding = generate_query_embedding(chunk_input["text"])
+    except Exception as exc:  # noqa: BLE001 - return a usable API error for embedding failures.
+        logger.exception("Failed to embed knowledge chunk")
+        return api_error(f"Failed to generate embedding: {exc}", 502)
+
+    row = {
+        "instagram_account_id": account["id"],
+        "text": chunk_input["text"],
+        "type": chunk_input["type"],
+        "source_url": chunk_input["source_url"],
+        "page_path": chunk_input["page_path"],
+        "title": chunk_input["title"],
+        "extra_metadata": {
+            "source": "frontend-login",
+            "created_by": user["id"],
+        },
+        "content_hash": hashlib.sha256(chunk_input["text"].encode("utf-8")).hexdigest(),
+        "embedding": embedding,
+    }
+
+    try:
+        chunk = insert_knowledge_chunk(row)
+    except SupabaseError as exc:
+        return api_error(str(exc), 500)
+
+    return jsonify({"chunk": serialize_knowledge_chunk_for_api(chunk)}), 201
 
 
 def serialize_promo_code_for_api(code_row):

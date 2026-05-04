@@ -20,6 +20,10 @@ PROMOTION_SETUP_SELECT = (
     "found_caption,error_message,poll_started_at,poll_expires_at,last_polled_at,"
     "found_at,extra_metadata,created_at,updated_at"
 )
+KNOWLEDGE_CHUNK_SELECT = (
+    "id,instagram_account_id,text,type,source_url,page_path,title,"
+    "meta_description,extra_metadata,content_hash,created_at"
+)
 
 
 class SupabaseError(Exception):
@@ -178,6 +182,33 @@ def match_knowledge_chunks(instagram_account_id, query_embedding, match_count=5)
         },
     )
     return rows or []
+
+
+def list_knowledge_chunks(instagram_account_id, limit=100):
+    rows = _request(
+        "GET",
+        "knowledge_chunks",
+        params={
+            "instagram_account_id": f"eq.{instagram_account_id}",
+            "select": KNOWLEDGE_CHUNK_SELECT,
+            "order": "created_at.desc",
+            "limit": str(limit),
+        },
+    )
+    return rows or []
+
+
+def insert_knowledge_chunk(row):
+    rows = _request(
+        "POST",
+        "knowledge_chunks",
+        params={"select": KNOWLEDGE_CHUNK_SELECT},
+        payload=row,
+        prefer="return=representation",
+    )
+    if not rows:
+        return None
+    return rows[0]
 
 
 def ensure_contact(instagram_account_id, sender_id, username=None):
