@@ -5,3 +5,10 @@ services:
     plan: free
     buildCommand: pip install -r backend/requirements.txt
     startCommand: python backend/app.py
+  - type: cron
+    name: process-promo-followups
+    runtime: python
+    plan: starter
+    schedule: "*/5 * * * *"
+    buildCommand: python --version
+    startCommand: python backend/process_due_followups.py

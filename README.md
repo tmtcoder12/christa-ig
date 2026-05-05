@@ -162,6 +162,15 @@ curl -X POST https://YOUR_BACKEND_HOST/api/followups/process-due \
 
 The processor finds pending SMS rows with `scheduled_for <= now()`, sends them through Twilio, then marks each row `sent` or `failed`.
 
+On Render, this repo defines a separate cron service named `process-promo-followups` in `render.yaml`. It runs every minute and calls the backend processor endpoint through `backend/process_due_followups.py`. Set these env vars on the cron service:
+
+```env
+BACKEND_URL=https://your-render-service.onrender.com
+FOLLOWUP_CRON_SECRET=the-same-secret-used-by-your-backend
+```
+
+The cron service is separate from the web service, so it does not automatically know the backend URL unless `BACKEND_URL` is set.
+
 The `frontend-login` Add Promotion page creates a pending `ig_promotion_setups` row through `POST /api/promotions`. The backend snapshots the selected account's existing `ig_posts.instagram_media_id` values, polls Instagram media every 30 seconds for up to 5 minutes, and turns the newest unseen media item into a promotional `ig_posts` row. Only one pending/polling setup can exist per Instagram account.
 
 ## Run locally
