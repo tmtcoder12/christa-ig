@@ -84,6 +84,8 @@ INSTAGRAM_MEDIA_URL = "https://graph.instagram.com/v24.0/{instagram_user_id}/med
 PROMOTION_POLL_INTERVAL_SECONDS = 30
 PROMOTION_POLL_TIMEOUT_SECONDS = 5 * 60
 SMS_STOP_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
+SMS_REPLY_TARGET_CHARS = 320
+MAX_SMS_BODY_CHARS = 700
 conversation_history = {}
 
 
@@ -144,6 +146,16 @@ def normalize_phone_number(raw_phone):
     return None
 
 
+def enforce_sms_body_limit(text, max_chars=MAX_SMS_BODY_CHARS):
+    normalized_text = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(normalized_text) <= max_chars:
+        return normalized_text
+
+    suffix = "..."
+    truncated = normalized_text[: max_chars - len(suffix)].rstrip()
+    return f"{truncated}{suffix}"
+
+
 def require_twilio_config():
     account_sid = os.environ.get("TWILIO_ACCOUNT_SID", "").strip()
     auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
@@ -159,11 +171,12 @@ def send_twilio_sms(to_phone_e164, body):
     except RuntimeError as exc:
         return {"success": False, "error": str(exc)}
 
+    safe_body = enforce_sms_body_limit(body)
     payload = urllib.parse.urlencode(
         {
             "To": to_phone_e164,
             "MessagingServiceSid": messaging_service_sid,
-            "Body": body,
+            "Body": safe_body,
         }
     ).encode("utf-8")
     credentials = base64.b64encode(f"{account_sid}:{auth_token}".encode("utf-8")).decode("ascii")
@@ -206,6 +219,7 @@ def create_and_send_sms(
     promo_lead_id=None,
     extra_metadata=None,
 ):
+    body = enforce_sms_body_limit(body)
     sms_message = create_sms_message(
         {
             "instagram_account_id": instagram_account_id,
@@ -276,7 +290,8 @@ def validate_twilio_request():
 def build_sms_chat_system_prompt(system_prompt):
     sms_instruction = (
         "You are replying by SMS. Keep replies concise, natural, and helpful. "
-        "Do not use markdown. Avoid long replies."
+        f"Do not use markdown. Target {SMS_REPLY_TARGET_CHARS} characters or fewer. "
+        f"Never exceed {MAX_SMS_BODY_CHARS} characters."
     )
     if system_prompt:
         return f"{system_prompt}\n\n{sms_instruction}"
@@ -1706,12 +1721,13 @@ def process_twilio_sms_reply(form_payload):
         system_prompt=build_sms_chat_system_prompt(instagram_account.get("system_prompt")),
         knowledge_context=rag_result["chunks"],
     )
+    reply_text = enforce_sms_body_limit(openai_result["reply_text"])
     latency_ms = int((time.perf_counter() - started_at) * 1000)
     sms_message, send_response = create_and_send_sms(
         instagram_account["id"],
         lead["contact_id"],
         from_phone,
-        openai_result["reply_text"],
+        reply_text,
         purpose="sms_llm_reply",
         promo_lead_id=lead["id"],
         extra_metadata={
@@ -1742,7 +1758,7 @@ def process_twilio_sms_reply(form_payload):
             "promo_lead_id": lead["id"],
             "role": "assistant",
             "direction": "outbound",
-            "body": openai_result["reply_text"],
+            "body": reply_text,
             "twilio_message_sid": send_response.get("sid"),
             "delivery_status": delivery_status,
             "model": openai_result.get("model"),
@@ -2079,7 +2095,7 @@ def schedule_sms_redemption_followup(promo_code):
         "promo_code_id": promo_code["id"],
         "promo_lead_id": (lead or {}).get("id"),
         "to_phone_e164": phone_e164,
-        "body": build_sms_followup_body(promo_code),
+        "body": enforce_sms_body_limit(build_sms_followup_body(promo_code)),
         "purpose": "post_redemption_followup",
         "status": "pending",
         "scheduled_for": scheduled_for.isoformat(),
@@ -2138,7 +2154,8 @@ def process_due_sms_message(sms_message):
         extra_metadata = {}
 
     try:
-        send_response = send_twilio_sms(claimed["to_phone_e164"], claimed["body"])
+        body = enforce_sms_body_limit(claimed["body"])
+        send_response = send_twilio_sms(claimed["to_phone_e164"], body)
         if not send_response.get("success"):
             error_message = send_response.get("error") or "Twilio SMS send failed"
             failed = mark_sms_message_failed(
