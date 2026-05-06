@@ -880,6 +880,28 @@ def clean_extracted_text(value):
     return cleaned
 
 
+def looks_like_phone_text(text):
+    return bool(fallback_phone_from_text(text) or normalize_phone_number(text))
+
+
+def clean_extracted_name(value, message_text):
+    cleaned = clean_extracted_text(value)
+    if not cleaned:
+        return None
+
+    normalized_name = re.sub(r"\s+", " ", cleaned).strip()
+    if not normalized_name or looks_like_phone_text(normalized_name):
+        return None
+
+    # Avoid storing a whole phone-only message as the customer's name when the
+    # extractor guesses from sparse context.
+    message = str(message_text or "").strip()
+    if message and normalize_phone_number(message) and normalized_name.casefold() == message.casefold():
+        return None
+
+    return normalized_name
+
+
 def fallback_phone_from_text(text):
     match = re.search(r"(\+?\d[\d\s().-]{7,}\d)", text or "")
     return match.group(1).strip() if match else None
@@ -891,12 +913,21 @@ def handle_promo_lead_capture(instagram_account, contact, session, history, mess
         return None
 
     extraction = extract_lead_contact_info(history)
-    extracted_name = clean_extracted_text(extraction.get("customer_name"))
-    extracted_phone = clean_extracted_text(extraction.get("phone")) or fallback_phone_from_text(message_text)
+    parsed_phone_from_message = fallback_phone_from_text(message_text)
+    extracted_phone = parsed_phone_from_message or clean_extracted_text(extraction.get("phone"))
+    extracted_name = clean_extracted_name(extraction.get("customer_name"), message_text)
 
-    customer_name = extracted_name or lead.get("customer_name")
-    phone_raw = extracted_phone or lead.get("phone_raw")
-    phone_e164 = normalize_phone_number(phone_raw) or lead.get("phone_e164")
+    existing_name = clean_extracted_text(lead.get("customer_name"))
+    existing_phone_raw = clean_extracted_text(lead.get("phone_raw"))
+    existing_phone_e164 = clean_extracted_text(lead.get("phone_e164"))
+
+    phone_raw = extracted_phone or existing_phone_raw
+    normalized_phone = normalize_phone_number(phone_raw)
+    phone_e164 = normalized_phone or existing_phone_e164
+    if not existing_name and not extracted_name and not phone_e164 and not looks_like_phone_text(message_text):
+        extracted_name = clean_extracted_name(message_text, message_text)
+
+    customer_name = existing_name or extracted_name
     has_name = bool(customer_name)
     has_phone = bool(phone_e164)
     now = datetime.now(timezone.utc).isoformat()
@@ -905,7 +936,11 @@ def handle_promo_lead_capture(instagram_account, contact, session, history, mess
         lead_metadata = {}
     lead_metadata = {
         **lead_metadata,
-        "last_extraction": extraction,
+        "last_extraction": {
+            **extraction,
+            "deterministic_phone": parsed_phone_from_message,
+            "normalized_phone": phone_e164,
+        },
     }
 
     lead_patch = {
@@ -960,11 +995,12 @@ def handle_promo_lead_capture(instagram_account, contact, session, history, mess
             lead = update_promo_lead(
                 lead["id"],
                 {
-                    "status": "code_sms_failed",
+                    "status": "collecting",
                     "error_message": error_message,
                     "extra_metadata": {
                         **(lead.get("extra_metadata") or {}),
                         "last_sms_message_id": sms_message["id"] if sms_message else None,
+                        "last_sms_failure": error_message,
                     },
                 },
             ) or lead
