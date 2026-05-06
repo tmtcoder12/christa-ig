@@ -76,12 +76,27 @@ export type PromoCodeFollowupSummary = {
 export type RedeemPromoCodeInput = {
   instagram_account_id: string;
   code: string;
+  redemption_notes?: string | null;
+};
+
+export type CustomerProfileSummary = {
+  id: string;
+  instagram_account_id: string;
+  contact_id: string | null;
+  phone_e164: string;
+  display_name: string | null;
+  first_redeemed_at: string;
+  last_redeemed_at: string;
+  redeem_count: number;
+  last_order_notes: string | null;
+  profile_summary: string | null;
 };
 
 export type RedeemPromoCodeResponse = {
   result: PromoCodeRedeemResult;
   promo_code: PromoCodeSummary | null;
   followup?: PromoCodeFollowupSummary | null;
+  customer_profile?: CustomerProfileSummary | null;
 };
 
 export type KnowledgeChunk = {

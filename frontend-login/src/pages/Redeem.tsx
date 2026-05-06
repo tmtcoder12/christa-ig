@@ -49,6 +49,7 @@ export function Redeem() {
   const { session } = useAuth();
   const { selectedInstagramAccount, selectedInstagramAccountId } = useAccountContext();
   const [code, setCode] = useState('');
+  const [redemptionNotes, setRedemptionNotes] = useState('');
   const [result, setResult] = useState<RedeemPromoCodeResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [submitting, setSubmitting] = useState(false);
@@ -80,10 +81,14 @@ export function Redeem() {
         {
           instagram_account_id: selectedInstagramAccountId,
           code: normalizedCode,
+          redemption_notes: redemptionNotes.trim() || null,
         },
         session.access_token,
       );
       setResult(redemption);
+      if (redemption.result === 'redeemed') {
+        setRedemptionNotes('');
+      }
     } catch (redeemError) {
       setError(redeemError instanceof Error ? redeemError.message : 'Unable to redeem promo code');
     } finally {
@@ -107,6 +112,17 @@ export function Redeem() {
             placeholder="PROMO-7F3KQ2"
             autoComplete="off"
             required
+          />
+        </label>
+
+        <label>
+          Staff notes
+          <textarea
+            value={redemptionNotes}
+            onChange={(event) => setRedemptionNotes(event.target.value)}
+            placeholder="What did they order? Anything useful for follow-up?"
+            maxLength={1000}
+            rows={4}
           />
         </label>
 
@@ -154,6 +170,17 @@ export function Redeem() {
               <div>
                 <dt>Follow-up</dt>
                 <dd>{formatTimestamp(result.followup.scheduled_for)}</dd>
+              </div>
+            ) : null}
+            {result.customer_profile ? (
+              <div>
+                <dt>Customer profile</dt>
+                <dd>
+                  Updated
+                  {result.customer_profile.redeem_count > 1
+                    ? ` (${result.customer_profile.redeem_count} redemptions)`
+                    : ''}
+                </dd>
               </div>
             ) : null}
           </dl>
