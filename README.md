@@ -39,6 +39,7 @@ For `comment-related` webhook events, promotional posts can be configured with t
 - `TWILIO_ACCOUNT_SID` is the Twilio account SID used for SMS delivery.
 - `TWILIO_AUTH_TOKEN` is the Twilio auth token used for SMS delivery. Keep this server-side only.
 - `TWILIO_MESSAGING_SERVICE_SID` is the Twilio Messaging Service SID used as the SMS sender.
+- `TWILIO_VALIDATE_SIGNATURE` optionally controls Twilio webhook signature validation. Defaults to `true`; set to `false` only for local/manual webhook testing.
 - `PORT` is provided by Render automatically.
 
 The `frontend-login` Vite app also uses browser-safe frontend env vars:
@@ -142,6 +143,14 @@ Automation is limited to one attempted DM per `post_id` and `contact_id`. The ap
 The app stores one readable promo code per customer/post in `ig_promo_codes`, but the initial Instagram DM does not reveal the code. Instead, the DM asks the customer to reply with their name and phone number so the code can be texted to them. The lead-capture state is stored in `ig_promo_leads`, and successful SMS sends are logged in `ig_sms_messages`. If `promotion_metadata.code_prefix` is not set, codes use the `PROMO` prefix.
 
 Inbound DMs are checked for an active collecting promo lead before the normal RAG chatbot path. The app extracts the customer name and phone number, normalizes US/Canada phone numbers to E.164, stores consent timing, and sends the promo code by Twilio SMS once both fields are available. If either field is missing or the phone number cannot be normalized, the Instagram reply asks only for the missing detail.
+
+If a promo customer replies by SMS, configure the Twilio Messaging Service incoming message webhook to:
+
+```text
+POST https://YOUR_BACKEND_HOST/api/twilio/sms-webhook
+```
+
+The backend matches inbound SMS by sender phone number against existing `ig_promo_leads`, stores the conversation in `ig_sms_conversations` and `ig_sms_conversation_messages`, retrieves RAG knowledge for the matched Instagram account, generates a concise SMS reply with OpenAI, and sends the reply through Twilio. Unknown phone numbers are ignored for v1. SMS stop keywords such as `STOP`, `UNSUBSCRIBE`, and `CANCEL` close the app-level SMS conversation and do not trigger the LLM.
 
 Promo code validity is controlled by `promo_code_valid_duration_hours` on the post:
 

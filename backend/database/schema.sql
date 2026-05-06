@@ -437,7 +437,7 @@ create table if not exists public.ig_sms_messages (
   to_phone_e164 text not null,
   body text not null,
   purpose text not null check (
-    purpose = any (array['promo_code', 'post_redemption_followup'])
+    purpose = any (array['promo_code', 'post_redemption_followup', 'sms_llm_reply'])
   ),
   status text not null default 'pending' check (
     status = any (array['pending', 'sending', 'sent', 'failed', 'cancelled'])
@@ -450,6 +450,55 @@ create table if not exists public.ig_sms_messages (
   extra_metadata jsonb not null default '{}'::jsonb,
   created_at timestamp with time zone not null default now(),
   updated_at timestamp with time zone not null default now()
+);
+
+create table if not exists public.ig_sms_conversations (
+  id uuid primary key default gen_random_uuid(),
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  contact_id uuid references public.ig_contacts(id) on delete set null,
+  promo_lead_id uuid references public.ig_promo_leads(id) on delete set null,
+  phone_e164 text not null,
+  status text not null default 'open' check (
+    status = any (array['open', 'closed', 'archived'])
+  ),
+  last_message_at timestamp with time zone not null default now(),
+  closed_at timestamp with time zone,
+  extra_metadata jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  constraint ig_sms_conversations_account_phone_key unique (instagram_account_id, phone_e164)
+);
+
+create table if not exists public.ig_sms_conversation_messages (
+  id uuid primary key default gen_random_uuid(),
+  conversation_id uuid not null references public.ig_sms_conversations(id) on delete cascade,
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  contact_id uuid references public.ig_contacts(id) on delete set null,
+  promo_lead_id uuid references public.ig_promo_leads(id) on delete set null,
+  role text not null check (role = any (array['user', 'assistant', 'system'])),
+  direction text not null check (direction = any (array['inbound', 'outbound', 'internal'])),
+  body text not null,
+  twilio_message_sid text,
+  delivery_status text not null default 'complete' check (
+    delivery_status = any (
+      array[
+        'received',
+        'queued',
+        'sent',
+        'delivered',
+        'complete',
+        'failed',
+        'error'
+      ]
+    )
+  ),
+  model text,
+  response_id text,
+  token_usage jsonb not null default '{}'::jsonb,
+  latency_ms integer check (latency_ms is null or latency_ms >= 0),
+  error_message text,
+  raw_payload jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now()
 );
 
 create table if not exists public.ig_comment_classifications (
@@ -614,6 +663,20 @@ create unique index if not exists ig_sms_messages_one_redemption_followup_per_co
   where purpose = 'post_redemption_followup'
     and promo_code_id is not null;
 
+create index if not exists ig_sms_conversations_account_activity_idx
+  on public.ig_sms_conversations (instagram_account_id, last_message_at desc);
+
+create index if not exists ig_sms_conversations_contact_activity_idx
+  on public.ig_sms_conversations (contact_id, last_message_at desc)
+  where contact_id is not null;
+
+create index if not exists ig_sms_conversation_messages_conversation_created_idx
+  on public.ig_sms_conversation_messages (conversation_id, created_at desc);
+
+create unique index if not exists ig_sms_conversation_messages_twilio_sid_key
+  on public.ig_sms_conversation_messages (twilio_message_sid)
+  where twilio_message_sid is not null;
+
 create index if not exists ig_comment_classifications_comment_classified_idx
   on public.ig_comment_classifications (comment_id, classified_at desc);
 
@@ -734,6 +797,10 @@ create trigger set_ig_sms_messages_updated_at
 before update on public.ig_sms_messages
 for each row execute function public.set_updated_at();
 
+create trigger set_ig_sms_conversations_updated_at
+before update on public.ig_sms_conversations
+for each row execute function public.set_updated_at();
+
 create or replace function public.current_user_business_role(target_business_id uuid)
 returns text
 language sql
@@ -821,6 +888,8 @@ alter table public.ig_promo_codes enable row level security;
 alter table public.ig_promo_code_followups enable row level security;
 alter table public.ig_promo_leads enable row level security;
 alter table public.ig_sms_messages enable row level security;
+alter table public.ig_sms_conversations enable row level security;
+alter table public.ig_sms_conversation_messages enable row level security;
 alter table public.ig_comment_classifications enable row level security;
 alter table public.meta_webhook_events enable row level security;
 
@@ -847,6 +916,8 @@ grant select on public.ig_promo_codes to authenticated;
 grant select on public.ig_promo_code_followups to authenticated;
 grant select on public.ig_promo_leads to authenticated;
 grant select on public.ig_sms_messages to authenticated;
+grant select on public.ig_sms_conversations to authenticated;
+grant select on public.ig_sms_conversation_messages to authenticated;
 grant select on public.ig_comment_classifications to authenticated;
 grant select on public.meta_webhook_events to authenticated;
 grant select on public.latest_ig_comment_classifications to authenticated;
@@ -1126,6 +1197,30 @@ using (
     select 1
     from public.instagram_accounts ia
     where ia.id = ig_sms_messages.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ig sms conversations select members"
+on public.ig_sms_conversations for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ig_sms_conversations.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ig sms conversation messages select members"
+on public.ig_sms_conversation_messages for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ig_sms_conversation_messages.instagram_account_id
       and public.user_has_business_access(ia.business_id)
   )
 );

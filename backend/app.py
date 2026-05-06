@@ -11,11 +11,12 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
-from flask import Flask, jsonify, request
+from flask import Flask, Response, jsonify, request
 from openai_client import extract_lead_contact_info, generate_query_embedding, generate_reply
 from supabase_client import (
     SupabaseError,
     claim_sms_message,
+    close_sms_conversation,
     create_promotion_setup,
     create_sms_message,
     ensure_contact,
@@ -23,13 +24,16 @@ from supabase_client import (
     expire_expired_promo_codes,
     ensure_promo_code,
     ensure_promo_lead,
+    ensure_sms_conversation,
     fetch_dm_history,
+    fetch_sms_conversation_history,
     get_comment_by_instagram_id,
     get_contact_by_id,
     get_collecting_promo_lead,
     get_instagram_account,
     get_instagram_account_by_id,
     get_instagram_post,
+    get_latest_promo_lead_by_phone,
     get_promo_code_by_id,
     get_promo_code_by_code,
     get_promo_lead_by_promo_code,
@@ -49,8 +53,11 @@ from supabase_client import (
     mark_sms_message_sent,
     match_knowledge_chunks,
     message_exists,
+    insert_sms_conversation_message,
     redeem_promo_code,
+    sms_conversation_message_exists,
     touch_dm_session,
+    touch_sms_conversation,
     update_contact_sms_details,
     update_comment_automation,
     update_promo_lead,
@@ -62,6 +69,11 @@ from supabase_client import (
     user_has_instagram_account_access,
 )
 
+try:
+    from twilio.request_validator import RequestValidator
+except ImportError:  # pragma: no cover - dependency is installed in deployed backend requirements.
+    RequestValidator = None
+
 
 app = Flask(__name__)
 logging.basicConfig(level=logging.INFO)
@@ -71,6 +83,7 @@ INSTAGRAM_COMMENT_REPLIES_URL = "https://graph.instagram.com/v24.0/{comment_id}/
 INSTAGRAM_MEDIA_URL = "https://graph.instagram.com/v24.0/{instagram_user_id}/media"
 PROMOTION_POLL_INTERVAL_SECONDS = 30
 PROMOTION_POLL_TIMEOUT_SECONDS = 5 * 60
+SMS_STOP_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
 conversation_history = {}
 
 
@@ -225,6 +238,49 @@ def create_and_send_sms(
         extra_metadata=merged_metadata,
     )
     return updated_sms, send_response
+
+
+def empty_twiml_response(status=200):
+    return Response("<Response></Response>", status=status, mimetype="text/xml")
+
+
+def get_public_request_url():
+    url = request.url
+    forwarded_proto = request.headers.get("X-Forwarded-Proto", "").split(",")[0].strip()
+    if forwarded_proto and "://" in url:
+        return f"{forwarded_proto}://{url.split('://', 1)[1]}"
+    return url
+
+
+def should_validate_twilio_signature():
+    return parse_bool_env("TWILIO_VALIDATE_SIGNATURE", True)
+
+
+def validate_twilio_request():
+    if not should_validate_twilio_signature():
+        return True, None
+
+    if RequestValidator is None:
+        return False, "Twilio request validator dependency is not installed"
+
+    auth_token = os.environ.get("TWILIO_AUTH_TOKEN", "").strip()
+    if not auth_token:
+        return False, "TWILIO_AUTH_TOKEN is not set"
+
+    signature = request.headers.get("X-Twilio-Signature", "")
+    validator = RequestValidator(auth_token)
+    is_valid = validator.validate(get_public_request_url(), request.form.to_dict(flat=True), signature)
+    return is_valid, None if is_valid else "Invalid Twilio signature"
+
+
+def build_sms_chat_system_prompt(system_prompt):
+    sms_instruction = (
+        "You are replying by SMS. Keep replies concise, natural, and helpful. "
+        "Do not use markdown. Avoid long replies."
+    )
+    if system_prompt:
+        return f"{system_prompt}\n\n{sms_instruction}"
+    return sms_instruction
 
 
 def classify_meta_event(payload):
@@ -1517,6 +1573,186 @@ def reply_to_instagram_comment(comment_id, text):
     )
 
 
+def process_twilio_sms_reply(form_payload):
+    message_sid = form_payload.get("MessageSid") or form_payload.get("SmsMessageSid") or form_payload.get("SmsSid")
+    from_phone = normalize_phone_number(form_payload.get("From"))
+    body = str(form_payload.get("Body") or "").strip()
+
+    if not message_sid or not from_phone or not body:
+        return {"processing_result": "twilio_sms_missing_required_fields"}
+
+    if sms_conversation_message_exists(message_sid):
+        return {"processing_result": "twilio_sms_duplicate_ignored", "twilio_message_sid": message_sid}
+
+    lead = get_latest_promo_lead_by_phone(from_phone)
+    if not lead:
+        return {
+            "processing_result": "twilio_sms_unknown_phone",
+            "twilio_message_sid": message_sid,
+            "from_phone": from_phone,
+        }
+
+    instagram_account = get_instagram_account_by_id(lead["instagram_account_id"])
+    if not instagram_account or instagram_account.get("status") != "connected":
+        return {
+            "processing_result": "twilio_sms_instagram_account_not_connected",
+            "twilio_message_sid": message_sid,
+            "instagram_account_id": lead["instagram_account_id"],
+        }
+
+    contact = get_contact_by_id(lead["contact_id"])
+    conversation = ensure_sms_conversation(
+        instagram_account["id"],
+        lead["contact_id"],
+        from_phone,
+        promo_lead_id=lead["id"],
+        extra_metadata={
+            "source": "twilio_sms_webhook",
+            "last_inbound_to": form_payload.get("To"),
+            "messaging_service_sid": form_payload.get("MessagingServiceSid"),
+        },
+    )
+    inbound_message = insert_sms_conversation_message(
+        {
+            "conversation_id": conversation["id"],
+            "instagram_account_id": instagram_account["id"],
+            "contact_id": lead["contact_id"],
+            "promo_lead_id": lead["id"],
+            "role": "user",
+            "direction": "inbound",
+            "body": body,
+            "twilio_message_sid": message_sid,
+            "delivery_status": "received",
+            "raw_payload": form_payload,
+        }
+    )
+    touch_sms_conversation(conversation["id"])
+
+    normalized_body = body.strip().upper()
+    if normalized_body in SMS_STOP_WORDS:
+        existing_metadata = conversation.get("extra_metadata") or {}
+        if not isinstance(existing_metadata, dict):
+            existing_metadata = {}
+        close_sms_conversation(
+            conversation["id"],
+            extra_metadata={
+                **existing_metadata,
+                "closed_by": "sms_stop_keyword",
+                "closed_message_sid": message_sid,
+            },
+        )
+        upsert_meta_webhook_event(
+            event_id=f"twilio:sms:{message_sid}",
+            business_id=instagram_account["business_id"],
+            instagram_account_id=instagram_account["id"],
+            event_type="twilio-sms",
+            payload=form_payload,
+            processing_status="processed",
+        )
+        return {
+            "processing_result": "twilio_sms_conversation_closed",
+            "conversation_id": conversation["id"],
+            "inbound_message_id": inbound_message["id"] if inbound_message else None,
+        }
+
+    if conversation.get("status") == "closed":
+        return {
+            "processing_result": "twilio_sms_conversation_already_closed",
+            "conversation_id": conversation["id"],
+            "inbound_message_id": inbound_message["id"] if inbound_message else None,
+        }
+
+    history = fetch_sms_conversation_history(conversation["id"])
+    rag_result = retrieve_knowledge_context(instagram_account["id"], body)
+    started_at = time.perf_counter()
+    openai_result = generate_reply(
+        history,
+        system_prompt=build_sms_chat_system_prompt(instagram_account.get("system_prompt")),
+        knowledge_context=rag_result["chunks"],
+    )
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    sms_message, send_response = create_and_send_sms(
+        instagram_account["id"],
+        lead["contact_id"],
+        from_phone,
+        openai_result["reply_text"],
+        purpose="sms_llm_reply",
+        promo_lead_id=lead["id"],
+        extra_metadata={
+            "source": "twilio_sms_llm_reply",
+            "conversation_id": conversation["id"],
+            "inbound_twilio_message_sid": message_sid,
+            "openai": {
+                "success": openai_result.get("success"),
+                "used_fallback": openai_result.get("used_fallback"),
+                "model": openai_result.get("model"),
+                "response_id": openai_result.get("response_id"),
+                "error": openai_result.get("error"),
+            },
+            "rag": {
+                "enabled": rag_result["enabled"],
+                "match_count": len(rag_result["chunks"]),
+                "error": rag_result["error"],
+            },
+        },
+    )
+    delivery_status = "sent" if send_response.get("success") else "failed"
+    error_message = None if send_response.get("success") else send_response.get("error")
+    outbound_message = insert_sms_conversation_message(
+        {
+            "conversation_id": conversation["id"],
+            "instagram_account_id": instagram_account["id"],
+            "contact_id": lead["contact_id"],
+            "promo_lead_id": lead["id"],
+            "role": "assistant",
+            "direction": "outbound",
+            "body": openai_result["reply_text"],
+            "twilio_message_sid": send_response.get("sid"),
+            "delivery_status": delivery_status,
+            "model": openai_result.get("model"),
+            "response_id": openai_result.get("response_id"),
+            "token_usage": openai_result.get("token_usage") or {},
+            "latency_ms": latency_ms,
+            "error_message": error_message or openai_result.get("error"),
+            "raw_payload": {
+                "send_response": send_response,
+                "sms_message_id": sms_message["id"] if sms_message else None,
+            },
+        }
+    )
+    touch_sms_conversation(conversation["id"])
+    upsert_meta_webhook_event(
+        event_id=f"twilio:sms:{message_sid}",
+        business_id=instagram_account["business_id"],
+        instagram_account_id=instagram_account["id"],
+        event_type="twilio-sms",
+        payload=form_payload,
+        processing_status="processed" if send_response.get("success") else "failed",
+        error_message=error_message,
+    )
+
+    return {
+        "processing_result": "twilio_sms_replied" if send_response.get("success") else "twilio_sms_send_failed",
+        "openai_result": openai_result,
+        "send_response": send_response,
+        "db_result": {
+            "business_id": instagram_account["business_id"],
+            "instagram_account_id": instagram_account["id"],
+            "contact_id": lead["contact_id"],
+            "conversation_id": conversation["id"],
+            "inbound_message_id": inbound_message["id"] if inbound_message else None,
+            "outbound_message_id": outbound_message["id"] if outbound_message else None,
+            "sms_message_id": sms_message["id"] if sms_message else None,
+            "rag": {
+                "enabled": rag_result["enabled"],
+                "match_count": len(rag_result["chunks"]),
+                "error": rag_result["error"],
+            },
+            "contact": contact,
+        },
+    }
+
+
 @app.get("/")
 def healthcheck():
     return jsonify({"status": "ok"})
@@ -1540,6 +1776,27 @@ def verify_webhook():
         bool(expected_token),
     )
     return "Forbidden", 403
+
+
+@app.post("/api/twilio/sms-webhook")
+def twilio_sms_webhook():
+    is_valid, validation_error = validate_twilio_request()
+    if not is_valid:
+        logger.warning("Twilio SMS webhook validation failed: %s", validation_error)
+        return Response("Forbidden", status=403, mimetype="text/plain")
+
+    if not is_supabase_configured():
+        logger.warning("Supabase is not configured; inbound Twilio SMS ignored.")
+        return empty_twiml_response()
+
+    form_payload = request.form.to_dict(flat=True)
+    try:
+        result = process_twilio_sms_reply(form_payload)
+        logger.info("Twilio SMS webhook processed: %s", result.get("processing_result"))
+        return empty_twiml_response()
+    except SupabaseError as exc:
+        logger.exception("Failed to process inbound Twilio SMS")
+        return Response(f"Database error: {exc}", status=500, mimetype="text/plain")
 
 
 @app.route("/api/promotions", methods=["OPTIONS"])

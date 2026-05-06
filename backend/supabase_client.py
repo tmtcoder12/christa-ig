@@ -39,6 +39,15 @@ SMS_MESSAGE_SELECT = (
     "body,purpose,status,scheduled_for,sent_at,twilio_message_sid,error_message,"
     "attempt_count,extra_metadata,created_at,updated_at"
 )
+SMS_CONVERSATION_SELECT = (
+    "id,instagram_account_id,contact_id,promo_lead_id,phone_e164,status,"
+    "last_message_at,closed_at,extra_metadata,created_at,updated_at"
+)
+SMS_CONVERSATION_MESSAGE_SELECT = (
+    "id,conversation_id,instagram_account_id,contact_id,promo_lead_id,role,"
+    "direction,body,twilio_message_sid,delivery_status,model,response_id,"
+    "token_usage,latency_ms,error_message,raw_payload,created_at"
+)
 
 
 class SupabaseError(Exception):
@@ -163,7 +172,7 @@ def get_instagram_account_by_id(instagram_account_id):
         "instagram_accounts",
         {
             "id": f"eq.{instagram_account_id}",
-            "select": "id,business_id,instagram_user_id,username,status",
+            "select": "id,business_id,instagram_user_id,username,status,system_prompt",
         },
     )
 
@@ -643,6 +652,18 @@ def get_promo_lead_by_promo_code(promo_code_id):
     )
 
 
+def get_latest_promo_lead_by_phone(phone_e164):
+    return _fetch_one(
+        "ig_promo_leads",
+        {
+            "phone_e164": f"eq.{phone_e164}",
+            "status": "neq.cancelled",
+            "select": PROMO_LEAD_SELECT,
+            "order": "created_at.desc",
+        },
+    )
+
+
 def update_promo_lead(lead_id, patch):
     rows = _patch_returning(
         "ig_promo_leads",
@@ -654,6 +675,114 @@ def update_promo_lead(lead_id, patch):
 
 def create_sms_message(row):
     return _insert("ig_sms_messages", row)
+
+
+def ensure_sms_conversation(instagram_account_id, contact_id, phone_e164, promo_lead_id=None, extra_metadata=None):
+    existing = _fetch_one(
+        "ig_sms_conversations",
+        {
+            "instagram_account_id": f"eq.{instagram_account_id}",
+            "phone_e164": f"eq.{phone_e164}",
+            "select": SMS_CONVERSATION_SELECT,
+        },
+    )
+    if existing:
+        patch = {
+            "contact_id": contact_id,
+            "last_message_at": datetime.now(timezone.utc).isoformat(),
+        }
+        if promo_lead_id:
+            patch["promo_lead_id"] = promo_lead_id
+        rows = _patch_returning(
+            "ig_sms_conversations",
+            {"id": f"eq.{existing['id']}", "select": SMS_CONVERSATION_SELECT},
+            patch,
+        )
+        return rows[0] if rows else existing
+
+    row = {
+        "instagram_account_id": instagram_account_id,
+        "contact_id": contact_id,
+        "phone_e164": phone_e164,
+        "last_message_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if promo_lead_id:
+        row["promo_lead_id"] = promo_lead_id
+    if extra_metadata:
+        row["extra_metadata"] = extra_metadata
+
+    return _upsert("ig_sms_conversations", row, "instagram_account_id,phone_e164")
+
+
+def touch_sms_conversation(conversation_id):
+    return _patch(
+        "ig_sms_conversations",
+        {"id": f"eq.{conversation_id}"},
+        {"last_message_at": datetime.now(timezone.utc).isoformat()},
+    )
+
+
+def close_sms_conversation(conversation_id, extra_metadata=None):
+    patch = {
+        "status": "closed",
+        "closed_at": datetime.now(timezone.utc).isoformat(),
+        "last_message_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if extra_metadata is not None:
+        patch["extra_metadata"] = extra_metadata
+
+    rows = _patch_returning(
+        "ig_sms_conversations",
+        {"id": f"eq.{conversation_id}", "select": SMS_CONVERSATION_SELECT},
+        patch,
+    )
+    return rows[0] if rows else None
+
+
+def sms_conversation_message_exists(twilio_message_sid):
+    if not twilio_message_sid:
+        return False
+    return bool(
+        _fetch_one(
+            "ig_sms_conversation_messages",
+            {
+                "twilio_message_sid": f"eq.{twilio_message_sid}",
+                "select": "id",
+            },
+        )
+    )
+
+
+def insert_sms_conversation_message(row):
+    rows = _request(
+        "POST",
+        "ig_sms_conversation_messages",
+        params={"select": SMS_CONVERSATION_MESSAGE_SELECT},
+        payload=row,
+        prefer="return=representation",
+    )
+    if not rows:
+        return None
+    return rows[0]
+
+
+def fetch_sms_conversation_history(conversation_id, limit=20):
+    rows = _request(
+        "GET",
+        "ig_sms_conversation_messages",
+        params={
+            "conversation_id": f"eq.{conversation_id}",
+            "select": "role,body,created_at",
+            "order": "created_at.desc",
+            "limit": str(limit),
+        },
+    )
+    rows = rows or []
+    return [
+        {"role": row["role"], "content": row["body"]}
+        for row in reversed(rows)
+        if row.get("role") in {"user", "assistant", "system"} and row.get("body")
+    ]
 
 
 def get_redemption_followup_sms_by_promo_code(promo_code_id):
