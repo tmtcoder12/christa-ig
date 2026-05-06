@@ -501,6 +501,23 @@ create table if not exists public.ig_sms_conversation_messages (
   created_at timestamp with time zone not null default now()
 );
 
+create table if not exists public.ig_customer_profiles (
+  id uuid primary key default gen_random_uuid(),
+  instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
+  contact_id uuid references public.ig_contacts(id) on delete set null,
+  phone_e164 text not null,
+  display_name text,
+  first_redeemed_at timestamp with time zone not null default now(),
+  last_redeemed_at timestamp with time zone not null default now(),
+  redeem_count integer not null default 1 check (redeem_count >= 1),
+  last_order_notes text,
+  profile_summary text,
+  extra_metadata jsonb not null default '{}'::jsonb,
+  created_at timestamp with time zone not null default now(),
+  updated_at timestamp with time zone not null default now(),
+  constraint ig_customer_profiles_account_phone_key unique (instagram_account_id, phone_e164)
+);
+
 create table if not exists public.ig_comment_classifications (
   id uuid primary key default gen_random_uuid(),
   comment_id uuid not null references public.ig_comments(id) on delete cascade,
@@ -677,6 +694,13 @@ create unique index if not exists ig_sms_conversation_messages_twilio_sid_key
   on public.ig_sms_conversation_messages (twilio_message_sid)
   where twilio_message_sid is not null;
 
+create index if not exists ig_customer_profiles_account_activity_idx
+  on public.ig_customer_profiles (instagram_account_id, last_redeemed_at desc);
+
+create index if not exists ig_customer_profiles_contact_idx
+  on public.ig_customer_profiles (contact_id)
+  where contact_id is not null;
+
 create index if not exists ig_comment_classifications_comment_classified_idx
   on public.ig_comment_classifications (comment_id, classified_at desc);
 
@@ -801,6 +825,10 @@ create trigger set_ig_sms_conversations_updated_at
 before update on public.ig_sms_conversations
 for each row execute function public.set_updated_at();
 
+create trigger set_ig_customer_profiles_updated_at
+before update on public.ig_customer_profiles
+for each row execute function public.set_updated_at();
+
 create or replace function public.current_user_business_role(target_business_id uuid)
 returns text
 language sql
@@ -890,6 +918,7 @@ alter table public.ig_promo_leads enable row level security;
 alter table public.ig_sms_messages enable row level security;
 alter table public.ig_sms_conversations enable row level security;
 alter table public.ig_sms_conversation_messages enable row level security;
+alter table public.ig_customer_profiles enable row level security;
 alter table public.ig_comment_classifications enable row level security;
 alter table public.meta_webhook_events enable row level security;
 
@@ -918,6 +947,7 @@ grant select on public.ig_promo_leads to authenticated;
 grant select on public.ig_sms_messages to authenticated;
 grant select on public.ig_sms_conversations to authenticated;
 grant select on public.ig_sms_conversation_messages to authenticated;
+grant select on public.ig_customer_profiles to authenticated;
 grant select on public.ig_comment_classifications to authenticated;
 grant select on public.meta_webhook_events to authenticated;
 grant select on public.latest_ig_comment_classifications to authenticated;
@@ -1221,6 +1251,18 @@ using (
     select 1
     from public.instagram_accounts ia
     where ia.id = ig_sms_conversation_messages.instagram_account_id
+      and public.user_has_business_access(ia.business_id)
+  )
+);
+
+create policy "ig customer profiles select members"
+on public.ig_customer_profiles for select
+to authenticated
+using (
+  exists (
+    select 1
+    from public.instagram_accounts ia
+    where ia.id = ig_customer_profiles.instagram_account_id
       and public.user_has_business_access(ia.business_id)
   )
 );

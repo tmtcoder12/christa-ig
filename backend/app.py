@@ -25,6 +25,7 @@ from supabase_client import (
     ensure_promo_code,
     ensure_promo_lead,
     ensure_sms_conversation,
+    ensure_customer_profile_from_redemption,
     fetch_dm_history,
     fetch_sms_conversation_history,
     get_comment_by_instagram_id,
@@ -466,6 +467,14 @@ def build_code_sms_body(promo_code):
 
 def build_sms_followup_body(promo_code):
     return f"Thanks for visiting and using code {promo_code['code']}! How was your experience?"
+
+
+def build_personalized_sms_followup_body(promo_code, customer_profile=None):
+    notes = (customer_profile or {}).get("last_order_notes")
+    if notes:
+        cleaned_notes = enforce_sms_body_limit(notes, max_chars=120).rstrip(".")
+        return f"Thanks for visiting! Hope you enjoyed {cleaned_notes}. How was everything?"
+    return build_sms_followup_body(promo_code)
 
 
 def parse_db_timestamp(value):
@@ -2066,6 +2075,23 @@ def serialize_sms_message_for_api(sms_message):
     }
 
 
+def serialize_customer_profile_for_api(profile):
+    if not profile:
+        return None
+    return {
+        "id": profile.get("id"),
+        "instagram_account_id": profile.get("instagram_account_id"),
+        "contact_id": profile.get("contact_id"),
+        "phone_e164": profile.get("phone_e164"),
+        "display_name": profile.get("display_name"),
+        "first_redeemed_at": profile.get("first_redeemed_at"),
+        "last_redeemed_at": profile.get("last_redeemed_at"),
+        "redeem_count": profile.get("redeem_count"),
+        "last_order_notes": profile.get("last_order_notes"),
+        "profile_summary": profile.get("profile_summary"),
+    }
+
+
 def parse_iso_datetime(value):
     if not value:
         return None
@@ -2075,7 +2101,7 @@ def parse_iso_datetime(value):
     return parsed
 
 
-def schedule_sms_redemption_followup(promo_code):
+def schedule_sms_redemption_followup(promo_code, customer_profile=None):
     existing = get_redemption_followup_sms_by_promo_code(promo_code["id"])
     if existing:
         return existing
@@ -2095,13 +2121,14 @@ def schedule_sms_redemption_followup(promo_code):
         "promo_code_id": promo_code["id"],
         "promo_lead_id": (lead or {}).get("id"),
         "to_phone_e164": phone_e164,
-        "body": enforce_sms_body_limit(build_sms_followup_body(promo_code)),
+        "body": enforce_sms_body_limit(build_personalized_sms_followup_body(promo_code, customer_profile)),
         "purpose": "post_redemption_followup",
         "status": "pending",
         "scheduled_for": scheduled_for.isoformat(),
         "extra_metadata": {
             "source": "promo_code_redemption",
             "followup_delay_minutes": delay_minutes,
+            **({"customer_profile_id": customer_profile.get("id")} if customer_profile else {}),
         },
     }
     try:
@@ -2124,9 +2151,14 @@ def validate_redeem_payload(payload):
     if not code:
         raise ValueError("code is required")
 
+    redemption_notes = clean_optional_string(payload.get("redemption_notes"))
+    if redemption_notes and len(redemption_notes) > 1000:
+        raise ValueError("redemption_notes must be 1000 characters or fewer")
+
     return {
         "instagram_account_id": instagram_account_id,
         "code": code,
+        "redemption_notes": redemption_notes,
     }
 
 
@@ -2277,12 +2309,30 @@ def redeem_promo_code_api():
         return jsonify({"result": "not_found", "promo_code": None})
 
     try:
-        redeemed_code = redeem_promo_code(code_row["id"], redeemed_by=user["id"])
+        redeemed_code = redeem_promo_code(
+            code_row["id"],
+            redeemed_by=user["id"],
+            redemption_notes=redeem_input.get("redemption_notes"),
+        )
         if not redeemed_code:
             refreshed_code = get_promo_code_by_code(account["id"], redeem_input["code"]) or code_row
             result = "already_redeemed" if refreshed_code.get("status") == "redeemed" else refreshed_code.get("status")
             return jsonify({"result": result, "promo_code": serialize_promo_code_for_api(refreshed_code)})
-        followup = schedule_sms_redemption_followup(redeemed_code)
+        lead = get_promo_lead_by_promo_code(redeemed_code["id"])
+        contact = get_contact_by_id(redeemed_code["contact_id"])
+        phone_e164 = (lead or {}).get("phone_e164") or (contact or {}).get("phone_e164")
+        display_name = (lead or {}).get("customer_name") or (contact or {}).get("display_name") or (contact or {}).get("username")
+        customer_profile = ensure_customer_profile_from_redemption(
+            redeemed_code["instagram_account_id"],
+            redeemed_code["contact_id"],
+            phone_e164,
+            display_name=display_name,
+            redeemed_at=redeemed_code.get("redeemed_at"),
+            order_notes=redeem_input.get("redemption_notes"),
+            redeemed_by=user["id"],
+            promo_code_id=redeemed_code["id"],
+        )
+        followup = schedule_sms_redemption_followup(redeemed_code, customer_profile=customer_profile)
     except SupabaseError as exc:
         return api_error(str(exc), 500)
     except ValueError as exc:
@@ -2293,6 +2343,7 @@ def redeem_promo_code_api():
             "result": "redeemed",
             "promo_code": serialize_promo_code_for_api(redeemed_code),
             "followup": serialize_sms_message_for_api(followup),
+            "customer_profile": serialize_customer_profile_for_api(customer_profile),
         }
     )
 

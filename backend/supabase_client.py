@@ -48,6 +48,11 @@ SMS_CONVERSATION_MESSAGE_SELECT = (
     "direction,body,twilio_message_sid,delivery_status,model,response_id,"
     "token_usage,latency_ms,error_message,raw_payload,created_at"
 )
+CUSTOMER_PROFILE_SELECT = (
+    "id,instagram_account_id,contact_id,phone_e164,display_name,first_redeemed_at,"
+    "last_redeemed_at,redeem_count,last_order_notes,profile_summary,extra_metadata,"
+    "created_at,updated_at"
+)
 
 
 class SupabaseError(Exception):
@@ -436,7 +441,7 @@ def get_promo_code_by_id(promo_code_id):
     )
 
 
-def redeem_promo_code(promo_code_id, redeemed_by=None):
+def redeem_promo_code(promo_code_id, redeemed_by=None, redemption_notes=None):
     now = datetime.now(timezone.utc).isoformat()
     existing = _fetch_one(
         "ig_promo_codes",
@@ -453,6 +458,8 @@ def redeem_promo_code(promo_code_id, redeemed_by=None):
         "redeemed_from": "frontend-login",
         "redeemed_by": redeemed_by,
     }
+    if redemption_notes:
+        extra_metadata["redemption_notes"] = redemption_notes
 
     rows = _patch_returning(
         "ig_promo_codes",
@@ -471,6 +478,98 @@ def redeem_promo_code(promo_code_id, redeemed_by=None):
         },
     )
     return rows[0] if rows else None
+
+
+def build_customer_profile_summary(existing_summary=None, display_name=None, order_notes=None):
+    summary_parts = []
+    if existing_summary:
+        summary_parts.append(str(existing_summary).strip())
+    if order_notes:
+        note_prefix = f"{display_name} ordered" if display_name else "Customer ordered"
+        summary_parts.append(f"{note_prefix}: {order_notes.strip()}")
+    summary = "\n".join(part for part in summary_parts if part)
+    return summary or None
+
+
+def ensure_customer_profile_from_redemption(
+    instagram_account_id,
+    contact_id,
+    phone_e164,
+    display_name=None,
+    redeemed_at=None,
+    order_notes=None,
+    redeemed_by=None,
+    promo_code_id=None,
+):
+    if not phone_e164:
+        return None
+
+    redeemed_at = redeemed_at or datetime.now(timezone.utc).isoformat()
+    existing = _fetch_one(
+        "ig_customer_profiles",
+        {
+            "instagram_account_id": f"eq.{instagram_account_id}",
+            "phone_e164": f"eq.{phone_e164}",
+            "select": CUSTOMER_PROFILE_SELECT,
+        },
+    )
+    existing_metadata = existing.get("extra_metadata") if existing else {}
+    if not isinstance(existing_metadata, dict):
+        existing_metadata = {}
+
+    redemption_events = existing_metadata.get("redemption_events")
+    if not isinstance(redemption_events, list):
+        redemption_events = []
+    redemption_events = [
+        *redemption_events[-19:],
+        {
+            "redeemed_at": redeemed_at,
+            "redeemed_by": redeemed_by,
+            "promo_code_id": promo_code_id,
+            "order_notes": order_notes,
+        },
+    ]
+    extra_metadata = {
+        **existing_metadata,
+        "last_redeemed_by": redeemed_by,
+        "last_promo_code_id": promo_code_id,
+        "redemption_events": redemption_events,
+    }
+
+    if existing:
+        patch = {
+            "contact_id": contact_id or existing.get("contact_id"),
+            "display_name": display_name or existing.get("display_name"),
+            "last_redeemed_at": redeemed_at,
+            "redeem_count": int(existing.get("redeem_count") or 0) + 1,
+            "last_order_notes": order_notes if order_notes is not None else existing.get("last_order_notes"),
+            "profile_summary": build_customer_profile_summary(
+                existing.get("profile_summary"),
+                display_name or existing.get("display_name"),
+                order_notes,
+            ),
+            "extra_metadata": extra_metadata,
+        }
+        rows = _patch_returning(
+            "ig_customer_profiles",
+            {"id": f"eq.{existing['id']}", "select": CUSTOMER_PROFILE_SELECT},
+            patch,
+        )
+        return rows[0] if rows else existing
+
+    row = {
+        "instagram_account_id": instagram_account_id,
+        "contact_id": contact_id,
+        "phone_e164": phone_e164,
+        "display_name": display_name,
+        "first_redeemed_at": redeemed_at,
+        "last_redeemed_at": redeemed_at,
+        "redeem_count": 1,
+        "last_order_notes": order_notes,
+        "profile_summary": build_customer_profile_summary(None, display_name, order_notes),
+        "extra_metadata": extra_metadata,
+    }
+    return _insert("ig_customer_profiles", row)
 
 
 def ensure_promo_code_followup(
