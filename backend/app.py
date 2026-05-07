@@ -937,16 +937,18 @@ def handle_promo_lead_capture(instagram_account, contact, session, history, mess
 
     extraction = extract_lead_contact_info(history)
     parsed_phone_from_message = fallback_phone_from_text(message_text)
-    extracted_phone = parsed_phone_from_message or clean_extracted_text(extraction.get("phone"))
+    current_message_phone_raw = parsed_phone_from_message
+    if not current_message_phone_raw and normalize_phone_number(message_text):
+        current_message_phone_raw = str(message_text or "").strip()
     extracted_name = clean_extracted_name(extraction.get("customer_name"), message_text)
 
     existing_name = clean_extracted_text(lead.get("customer_name"))
     existing_phone_raw = clean_extracted_text(lead.get("phone_raw"))
     existing_phone_e164 = clean_extracted_text(lead.get("phone_e164"))
 
-    phone_raw = extracted_phone or existing_phone_raw
-    normalized_phone = normalize_phone_number(phone_raw)
-    phone_e164 = normalized_phone or existing_phone_e164
+    current_message_phone_e164 = normalize_phone_number(current_message_phone_raw)
+    phone_raw = current_message_phone_raw or existing_phone_raw
+    phone_e164 = current_message_phone_e164 or existing_phone_e164
     if not existing_name and not extracted_name and not phone_e164 and not looks_like_phone_text(message_text):
         extracted_name = clean_extracted_name(message_text, message_text)
 
@@ -962,7 +964,14 @@ def handle_promo_lead_capture(instagram_account, contact, session, history, mess
         "last_extraction": {
             **extraction,
             "deterministic_phone": parsed_phone_from_message,
+            "current_message_phone_raw": current_message_phone_raw,
             "normalized_phone": phone_e164,
+            "lead_session_name_required": True,
+            "lead_session_name_valid": bool(customer_name),
+            "current_message_name_valid": bool(extracted_name),
+            "lead_session_phone_required": True,
+            "lead_session_phone_valid": bool(phone_e164),
+            "current_message_phone_valid": bool(current_message_phone_e164),
         },
     }
 
