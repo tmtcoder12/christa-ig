@@ -469,10 +469,9 @@ def build_sms_followup_body(promo_code):
     return f"Thanks for visiting and using code {promo_code['code']}! How was your experience?"
 
 
-def build_personalized_sms_followup_body(promo_code, customer_profile=None):
-    notes = (customer_profile or {}).get("last_order_notes")
-    if notes:
-        cleaned_notes = enforce_sms_body_limit(notes, max_chars=120).rstrip(".")
+def build_personalized_sms_followup_body(promo_code, redemption_notes=None):
+    if redemption_notes:
+        cleaned_notes = enforce_sms_body_limit(redemption_notes, max_chars=120).rstrip(".")
         return f"Thanks for visiting! Hope you enjoyed {cleaned_notes}. How was everything?"
     return build_sms_followup_body(promo_code)
 
@@ -2101,7 +2100,7 @@ def parse_iso_datetime(value):
     return parsed
 
 
-def schedule_sms_redemption_followup(promo_code, customer_profile=None):
+def schedule_sms_redemption_followup(promo_code, customer_profile=None, redemption_notes=None):
     existing = get_redemption_followup_sms_by_promo_code(promo_code["id"])
     if existing:
         return existing
@@ -2121,7 +2120,7 @@ def schedule_sms_redemption_followup(promo_code, customer_profile=None):
         "promo_code_id": promo_code["id"],
         "promo_lead_id": (lead or {}).get("id"),
         "to_phone_e164": phone_e164,
-        "body": enforce_sms_body_limit(build_personalized_sms_followup_body(promo_code, customer_profile)),
+        "body": enforce_sms_body_limit(build_personalized_sms_followup_body(promo_code, redemption_notes)),
         "purpose": "post_redemption_followup",
         "status": "pending",
         "scheduled_for": scheduled_for.isoformat(),
@@ -2129,6 +2128,7 @@ def schedule_sms_redemption_followup(promo_code, customer_profile=None):
             "source": "promo_code_redemption",
             "followup_delay_minutes": delay_minutes,
             **({"customer_profile_id": customer_profile.get("id")} if customer_profile else {}),
+            **({"redemption_notes_used": True} if redemption_notes else {}),
         },
     }
     try:
@@ -2332,7 +2332,11 @@ def redeem_promo_code_api():
             redeemed_by=user["id"],
             promo_code_id=redeemed_code["id"],
         )
-        followup = schedule_sms_redemption_followup(redeemed_code, customer_profile=customer_profile)
+        followup = schedule_sms_redemption_followup(
+            redeemed_code,
+            customer_profile=customer_profile,
+            redemption_notes=redeem_input.get("redemption_notes"),
+        )
     except SupabaseError as exc:
         return api_error(str(exc), 500)
     except ValueError as exc:
