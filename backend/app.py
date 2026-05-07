@@ -465,15 +465,24 @@ def build_code_sms_body(promo_code):
     return f"Your promo code is {promo_code['code']}. Show this code when you redeem your offer."
 
 
-def build_sms_followup_body(promo_code):
-    return f"Thanks for visiting and using code {promo_code['code']}! How was your experience?"
+def first_name_from_display_name(display_name):
+    cleaned_name = clean_extracted_text(display_name)
+    return cleaned_name.split()[0] if cleaned_name else None
 
 
-def build_personalized_sms_followup_body(promo_code, redemption_notes=None):
+def build_sms_followup_body(promo_code, display_name=None):
+    first_name = first_name_from_display_name(display_name)
+    greeting = f"Hi {first_name}, thanks" if first_name else "Thanks"
+    return f"{greeting} for visiting and using code {promo_code['code']}! How was your experience?"
+
+
+def build_personalized_sms_followup_body(promo_code, redemption_notes=None, display_name=None):
+    first_name = first_name_from_display_name(display_name)
+    greeting = f"Hi {first_name}, thanks" if first_name else "Thanks"
     if redemption_notes:
         cleaned_notes = enforce_sms_body_limit(redemption_notes, max_chars=120).rstrip(".")
-        return f"Thanks for visiting! Hope you enjoyed {cleaned_notes}. How was everything?"
-    return build_sms_followup_body(promo_code)
+        return f"{greeting} for visiting! Hope you enjoyed {cleaned_notes}. How was everything?"
+    return build_sms_followup_body(promo_code, display_name=display_name)
 
 
 def parse_db_timestamp(value):
@@ -2119,6 +2128,12 @@ def schedule_sms_redemption_followup(promo_code, customer_profile=None, redempti
     phone_e164 = (lead or {}).get("phone_e164") or (contact or {}).get("phone_e164")
     if not phone_e164:
         return None
+    display_name = (
+        (customer_profile or {}).get("display_name")
+        or (lead or {}).get("customer_name")
+        or (contact or {}).get("display_name")
+        or (contact or {}).get("username")
+    )
 
     redeemed_at = parse_iso_datetime(promo_code.get("redeemed_at")) or datetime.now(timezone.utc)
     delay_minutes = parse_int_env("FOLLOWUP_DELAY_MINUTES", 10)
@@ -2129,7 +2144,13 @@ def schedule_sms_redemption_followup(promo_code, customer_profile=None, redempti
         "promo_code_id": promo_code["id"],
         "promo_lead_id": (lead or {}).get("id"),
         "to_phone_e164": phone_e164,
-        "body": enforce_sms_body_limit(build_personalized_sms_followup_body(promo_code, redemption_notes)),
+        "body": enforce_sms_body_limit(
+            build_personalized_sms_followup_body(
+                promo_code,
+                redemption_notes=redemption_notes,
+                display_name=display_name,
+            )
+        ),
         "purpose": "post_redemption_followup",
         "status": "pending",
         "scheduled_for": scheduled_for.isoformat(),
@@ -2137,6 +2158,7 @@ def schedule_sms_redemption_followup(promo_code, customer_profile=None, redempti
             "source": "promo_code_redemption",
             "followup_delay_minutes": delay_minutes,
             **({"customer_profile_id": customer_profile.get("id")} if customer_profile else {}),
+            **({"display_name_used": display_name} if display_name else {}),
             **({"redemption_notes_used": True} if redemption_notes else {}),
         },
     }
