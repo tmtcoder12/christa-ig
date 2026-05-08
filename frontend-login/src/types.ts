@@ -14,11 +14,13 @@ export type InstagramAccount = {
 };
 
 export type PromotionSetupStatus = 'pending' | 'polling' | 'found' | 'expired' | 'error';
+export type CommentTriggerMode = 'keywords' | 'restaurant_intent' | 'keywords_or_restaurant_intent';
 
 export type PromotionSetup = {
   id: string;
   instagram_account_id: string;
   submitted_by: string;
+  comment_trigger_mode: CommentTriggerMode;
   trigger_keywords: string[];
   automation_starts_at: string | null;
   automation_ends_at: string | null;
@@ -42,6 +44,7 @@ export type PromotionSetup = {
 
 export type CreatePromotionSetupInput = {
   instagram_account_id: string;
+  comment_trigger_mode: CommentTriggerMode;
   trigger_keywords: string[];
   automation_starts_at: string | null;
   automation_ends_at: string | null;

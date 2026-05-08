@@ -2,7 +2,7 @@ import { FormEvent, useEffect, useMemo, useState } from 'react';
 import { createPromotionSetup, fetchPromotionSetup } from '../lib/backend';
 import { useAccountContext } from '../lib/accountContext';
 import { useAuth } from '../lib/auth';
-import type { PromotionSetup } from '../types';
+import type { CommentTriggerMode, PromotionSetup } from '../types';
 
 function parseKeywords(value: string) {
   return value
@@ -32,6 +32,7 @@ function isActiveSetup(setup: PromotionSetup | null) {
 export function AddPromotion() {
   const { session } = useAuth();
   const { selectedInstagramAccount, selectedInstagramAccountId } = useAccountContext();
+  const [commentTriggerMode, setCommentTriggerMode] = useState<CommentTriggerMode>('keywords');
   const [triggerKeywords, setTriggerKeywords] = useState('');
   const [automationStartsAt, setAutomationStartsAt] = useState('');
   const [automationEndsAt, setAutomationEndsAt] = useState('');
@@ -44,6 +45,7 @@ export function AddPromotion() {
   const [submitting, setSubmitting] = useState(false);
 
   const keywords = useMemo(() => parseKeywords(triggerKeywords), [triggerKeywords]);
+  const keywordsRequired = commentTriggerMode !== 'restaurant_intent';
 
   useEffect(() => {
     if (!setup || !isActiveSetup(setup) || !session?.access_token) {
@@ -73,7 +75,7 @@ export function AddPromotion() {
       setError('Select an Instagram account before creating a promotion.');
       return;
     }
-    if (!keywords.length) {
+    if (keywordsRequired && !keywords.length) {
       setError('Add at least one trigger keyword.');
       return;
     }
@@ -84,6 +86,7 @@ export function AddPromotion() {
       const { setup: createdSetup } = await createPromotionSetup(
         {
           instagram_account_id: selectedInstagramAccountId,
+          comment_trigger_mode: commentTriggerMode,
           trigger_keywords: keywords,
           automation_starts_at: datetimeLocalToIso(automationStartsAt),
           automation_ends_at: datetimeLocalToIso(automationEndsAt),
@@ -111,6 +114,18 @@ export function AddPromotion() {
 
       <form className="form-panel" onSubmit={handleSubmit}>
         <div className="form-grid">
+          <label>
+            Trigger mode
+            <select
+              value={commentTriggerMode}
+              onChange={(event) => setCommentTriggerMode(event.target.value as CommentTriggerMode)}
+            >
+              <option value="keywords">Keyword comments</option>
+              <option value="restaurant_intent">Restaurant questions/comments</option>
+              <option value="keywords_or_restaurant_intent">Keywords or restaurant questions/comments</option>
+            </select>
+          </label>
+
           <label className="full-width-field">
             Trigger keywords
             <textarea
@@ -118,7 +133,7 @@ export function AddPromotion() {
               onChange={(event) => setTriggerKeywords(event.target.value)}
               placeholder="DM&#10;Menu&#10;Promo"
               rows={4}
-              required
+              required={keywordsRequired}
             />
           </label>
 
