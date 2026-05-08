@@ -12,7 +12,12 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 
 from flask import Flask, Response, jsonify, request
-from openai_client import extract_lead_contact_info, generate_query_embedding, generate_reply
+from openai_client import (
+    classify_restaurant_comment_for_promo,
+    extract_lead_contact_info,
+    generate_query_embedding,
+    generate_reply,
+)
 from supabase_client import (
     SupabaseError,
     claim_sms_message,
@@ -42,6 +47,7 @@ from supabase_client import (
     get_redemption_followup_sms_by_promo_code,
     has_prior_comment_automation,
     insert_dm_message,
+    insert_comment_classification,
     insert_knowledge_chunk,
     is_configured as is_supabase_configured,
     is_promo_code_valid,
@@ -87,6 +93,17 @@ PROMOTION_POLL_TIMEOUT_SECONDS = 5 * 60
 SMS_STOP_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
 SMS_REPLY_TARGET_CHARS = 320
 MAX_SMS_BODY_CHARS = 700
+COMMENT_TRIGGER_KEYWORDS = "keywords"
+COMMENT_TRIGGER_RESTAURANT_INTENT = "restaurant_intent"
+COMMENT_TRIGGER_KEYWORDS_OR_INTENT = "keywords_or_restaurant_intent"
+VALID_COMMENT_TRIGGER_MODES = {
+    COMMENT_TRIGGER_KEYWORDS,
+    COMMENT_TRIGGER_RESTAURANT_INTENT,
+    COMMENT_TRIGGER_KEYWORDS_OR_INTENT,
+}
+RESTAURANT_INTENT_TRIGGER_PREFIX = "restaurant_intent"
+DEFAULT_COMMENT_CLASSIFIER_MIN_CONFIDENCE = 0.65
+NON_TRIGGER_RESTAURANT_INTENT_CATEGORIES = {"spam_or_unrelated", "complaint_or_negative"}
 conversation_history = {}
 
 
@@ -128,6 +145,19 @@ def parse_int_env(name, default):
     except ValueError:
         return default
     return value if value > 0 else default
+
+
+def parse_float_env(name, default):
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    if value < 0 or value > 1:
+        return default
+    return value
 
 
 def normalize_phone_number(raw_phone):
@@ -449,6 +479,145 @@ def find_matched_keyword(comment_text, keywords):
     return None
 
 
+def normalize_comment_trigger_mode(value):
+    mode = str(value or COMMENT_TRIGGER_KEYWORDS).strip()
+    return mode if mode in VALID_COMMENT_TRIGGER_MODES else COMMENT_TRIGGER_KEYWORDS
+
+
+def trigger_mode_uses_keywords(mode):
+    return mode in {COMMENT_TRIGGER_KEYWORDS, COMMENT_TRIGGER_KEYWORDS_OR_INTENT}
+
+
+def trigger_mode_uses_restaurant_intent(mode):
+    return mode in {COMMENT_TRIGGER_RESTAURANT_INTENT, COMMENT_TRIGGER_KEYWORDS_OR_INTENT}
+
+
+def normalize_classification_category(category):
+    normalized = re.sub(r"[^a-z0-9_]+", "_", str(category or "").strip().lower()).strip("_")
+    return normalized or "general_restaurant_comment"
+
+
+def get_comment_classifier_min_confidence():
+    return parse_float_env("COMMENT_CLASSIFIER_MIN_CONFIDENCE", DEFAULT_COMMENT_CLASSIFIER_MIN_CONFIDENCE)
+
+
+def store_comment_classification(comment_id, business_id, classifier_result, trigger_mode, threshold):
+    classification = {
+        "should_trigger": bool(classifier_result.get("should_trigger")),
+        "category": classifier_result.get("category"),
+        "confidence": classifier_result.get("confidence"),
+        "trigger_mode": trigger_mode,
+        "threshold": threshold,
+        "token_usage": classifier_result.get("token_usage") or {},
+        "response_id": classifier_result.get("response_id"),
+    }
+    row = {
+        "comment_id": comment_id,
+        "business_id": business_id,
+        "model": (
+            classifier_result.get("model")
+            or os.environ.get("COMMENT_CLASSIFIER_MODEL")
+            or os.environ.get("OPENAI_MODEL", "")
+        ),
+        "classification": classification,
+        "confidence": classifier_result.get("confidence"),
+        "reasoning": classifier_result.get("reasoning"),
+        "status": "success" if classifier_result.get("success") else "error",
+        "error_message": classifier_result.get("error"),
+    }
+    try:
+        return insert_comment_classification(row)
+    except SupabaseError as exc:
+        logger.warning("Unable to store comment classification for comment %s: %s", comment_id, exc)
+        return None
+
+
+def resolve_comment_automation_trigger(comment_text, post, instagram_account, comment):
+    mode = normalize_comment_trigger_mode(post.get("comment_trigger_mode"))
+    if trigger_mode_uses_keywords(mode):
+        matched_keyword = find_matched_keyword(comment_text, post.get("trigger_keywords"))
+        if matched_keyword:
+            return {
+                "matched": True,
+                "trigger_source": "keyword",
+                "matched_trigger": matched_keyword,
+                "classification": None,
+                "classification_row": None,
+                "no_match_event": None,
+                "error": None,
+            }
+        if mode == COMMENT_TRIGGER_KEYWORDS:
+            return {
+                "matched": False,
+                "trigger_source": None,
+                "matched_trigger": None,
+                "classification": None,
+                "classification_row": None,
+                "no_match_event": "comment_no_keyword_match",
+                "error": None,
+            }
+
+    if not trigger_mode_uses_restaurant_intent(mode):
+        return {
+            "matched": False,
+            "trigger_source": None,
+            "matched_trigger": None,
+            "classification": None,
+            "classification_row": None,
+            "no_match_event": "comment_no_trigger_match",
+            "error": None,
+        }
+
+    threshold = get_comment_classifier_min_confidence()
+    classifier_result = classify_restaurant_comment_for_promo(comment_text, post_caption=post.get("caption"))
+    classification_row = store_comment_classification(
+        comment["id"],
+        instagram_account["business_id"],
+        classifier_result,
+        mode,
+        threshold,
+    )
+    if not classifier_result.get("success"):
+        return {
+            "matched": False,
+            "trigger_source": "restaurant_intent",
+            "matched_trigger": None,
+            "classification": classifier_result,
+            "classification_row": classification_row,
+            "no_match_event": "comment_classifier_failed",
+            "error": classifier_result.get("error"),
+        }
+
+    confidence = classifier_result.get("confidence")
+    confidence = confidence if isinstance(confidence, (int, float)) else 0
+    category = normalize_classification_category(classifier_result.get("category"))
+    should_trigger = (
+        bool(classifier_result.get("should_trigger"))
+        and confidence >= threshold
+        and category not in NON_TRIGGER_RESTAURANT_INTENT_CATEGORIES
+    )
+    if not should_trigger:
+        return {
+            "matched": False,
+            "trigger_source": "restaurant_intent",
+            "matched_trigger": None,
+            "classification": classifier_result,
+            "classification_row": classification_row,
+            "no_match_event": "comment_no_restaurant_intent_match",
+            "error": None,
+        }
+
+    return {
+        "matched": True,
+        "trigger_source": "restaurant_intent",
+        "matched_trigger": f"{RESTAURANT_INTENT_TRIGGER_PREFIX}:{category}",
+        "classification": classifier_result,
+        "classification_row": classification_row,
+        "no_match_event": None,
+        "error": None,
+    }
+
+
 def build_lead_capture_dm_text():
     return "Thanks! Reply with your name and phone number and we'll text you the promo code."
 
@@ -597,7 +766,11 @@ def validate_promotion_payload(payload):
     if not instagram_account_id:
         raise ValueError("instagram_account_id is required")
 
-    raw_keywords = payload.get("trigger_keywords")
+    comment_trigger_mode = str(payload.get("comment_trigger_mode") or COMMENT_TRIGGER_KEYWORDS).strip()
+    if comment_trigger_mode not in VALID_COMMENT_TRIGGER_MODES:
+        raise ValueError("comment_trigger_mode must be keywords, restaurant_intent, or keywords_or_restaurant_intent")
+
+    raw_keywords = payload.get("trigger_keywords", [])
     if not isinstance(raw_keywords, list):
         raise ValueError("trigger_keywords must be an array")
 
@@ -608,7 +781,7 @@ def validate_promotion_payload(payload):
         stripped = keyword.strip()
         if stripped and stripped not in trigger_keywords:
             trigger_keywords.append(stripped)
-    if not trigger_keywords:
+    if comment_trigger_mode in {COMMENT_TRIGGER_KEYWORDS, COMMENT_TRIGGER_KEYWORDS_OR_INTENT} and not trigger_keywords:
         raise ValueError("At least one trigger keyword is required")
 
     comment_reply_text = str(payload.get("comment_reply_text") or "").strip()
@@ -636,6 +809,7 @@ def validate_promotion_payload(payload):
 
     return {
         "instagram_account_id": instagram_account_id,
+        "comment_trigger_mode": comment_trigger_mode,
         "trigger_keywords": trigger_keywords,
         "automation_starts_at": automation_starts_at,
         "automation_ends_at": automation_ends_at,
@@ -752,6 +926,7 @@ def build_promotional_post_row(setup, media_item):
         "posted_at": timestamp.isoformat() if timestamp else None,
         "post_type": "promotional",
         "automation_enabled": True,
+        "comment_trigger_mode": normalize_comment_trigger_mode(setup.get("comment_trigger_mode")),
         "automation_starts_at": setup.get("automation_starts_at"),
         "automation_ends_at": setup.get("automation_ends_at"),
         "trigger_keywords": setup.get("trigger_keywords") or [],
@@ -1425,10 +1600,15 @@ def process_comment_with_database(comment_info, payload, event_type):
             },
         }
 
-    matched_keyword = find_matched_keyword(comment_text, post.get("trigger_keywords"))
-    if not matched_keyword:
-        comment = upsert_comment(**base_comment_kwargs)
-        processing_result = log_comment_event("comment_no_keyword_match")
+    comment = upsert_comment(**base_comment_kwargs)
+    trigger_result = resolve_comment_automation_trigger(comment_text, post, instagram_account, comment)
+    matched_trigger = trigger_result.get("matched_trigger")
+    if not trigger_result.get("matched"):
+        processing_result = log_comment_event(
+            trigger_result.get("no_match_event") or "comment_no_trigger_match",
+            processing_status="failed" if trigger_result.get("error") else "ignored",
+            error_message=trigger_result.get("error"),
+        )
         return {
             "processing_result": processing_result,
             "openai_result": None,
@@ -1438,14 +1618,18 @@ def process_comment_with_database(comment_info, payload, event_type):
                 "instagram_account_id": instagram_account["id"],
                 "post_id": post["id"],
                 "comment_id": comment["id"] if comment else None,
+                "comment_trigger_mode": normalize_comment_trigger_mode(post.get("comment_trigger_mode")),
+                "classification_id": (
+                    trigger_result.get("classification_row") or {}
+                ).get("id"),
             },
         }
 
     if has_prior_comment_automation(post["id"], contact["id"]):
-        comment = upsert_comment(
-            **base_comment_kwargs,
+        update_comment_automation(
+            comment["id"],
             automation_status="duplicate",
-            matched_keyword=matched_keyword,
+            matched_keyword=matched_trigger,
         )
         processing_result = log_comment_event("comment_duplicate_automation")
         return {
@@ -1458,13 +1642,19 @@ def process_comment_with_database(comment_info, payload, event_type):
                 "post_id": post["id"],
                 "comment_id": comment["id"] if comment else None,
                 "contact_id": contact["id"],
+                "comment_trigger_mode": normalize_comment_trigger_mode(post.get("comment_trigger_mode")),
+                "matched_trigger": matched_trigger,
+                "trigger_source": trigger_result.get("trigger_source"),
+                "classification_id": (
+                    trigger_result.get("classification_row") or {}
+                ).get("id"),
             },
         }
 
-    comment = upsert_comment(
-        **base_comment_kwargs,
-        automation_status="pending",
-        matched_keyword=matched_keyword,
+    update_comment_automation(
+        comment["id"],
+        "pending",
+        matched_keyword=matched_trigger,
     )
     promotion_metadata = post.get("promotion_metadata") or {}
     code_prefix = promotion_metadata.get("code_prefix") if isinstance(promotion_metadata, dict) else None
@@ -1483,7 +1673,12 @@ def process_comment_with_database(comment_info, payload, event_type):
         comment["id"],
         promo_code["id"],
         extra_metadata={
-            "matched_keyword": matched_keyword,
+            "matched_keyword": matched_trigger,
+            "comment_trigger_mode": normalize_comment_trigger_mode(post.get("comment_trigger_mode")),
+            "trigger_source": trigger_result.get("trigger_source"),
+            "classification_id": (
+                trigger_result.get("classification_row") or {}
+            ).get("id"),
             "source": "comment_to_dm",
         },
     )
@@ -1561,6 +1756,12 @@ def process_comment_with_database(comment_info, payload, event_type):
             "promo_lead_id": promo_lead["id"],
             "promo_code_valid_from": promo_code.get("valid_from"),
             "promo_code_expires_at": promo_code.get("expires_at"),
+            "comment_trigger_mode": normalize_comment_trigger_mode(post.get("comment_trigger_mode")),
+            "matched_trigger": matched_trigger,
+            "trigger_source": trigger_result.get("trigger_source"),
+            "classification_id": (
+                trigger_result.get("classification_row") or {}
+            ).get("id"),
         },
     }
 
@@ -2420,6 +2621,7 @@ def create_promotion():
     setup_row = {
         "instagram_account_id": account["id"],
         "submitted_by": user["id"],
+        "comment_trigger_mode": promotion_input["comment_trigger_mode"],
         "trigger_keywords": promotion_input["trigger_keywords"],
         "automation_starts_at": promotion_input["automation_starts_at"],
         "automation_ends_at": promotion_input["automation_ends_at"],

@@ -14,11 +14,11 @@ PROMO_CODE_ALPHABET = string.ascii_uppercase + string.digits
 PROMO_CODE_SUFFIX_LENGTH = 6
 PROMO_CODE_MAX_ATTEMPTS = 8
 PROMOTION_SETUP_SELECT = (
-    "id,instagram_account_id,submitted_by,trigger_keywords,automation_starts_at,"
-    "automation_ends_at,promo_code_valid_duration_hours,comment_reply_text,dm_prompt,"
-    "code_prefix,baseline_media_ids,status,post_id,found_instagram_media_id,"
-    "found_caption,error_message,poll_started_at,poll_expires_at,last_polled_at,"
-    "found_at,extra_metadata,created_at,updated_at"
+    "id,instagram_account_id,submitted_by,comment_trigger_mode,trigger_keywords,"
+    "automation_starts_at,automation_ends_at,promo_code_valid_duration_hours,"
+    "comment_reply_text,dm_prompt,code_prefix,baseline_media_ids,status,post_id,"
+    "found_instagram_media_id,found_caption,error_message,poll_started_at,"
+    "poll_expires_at,last_polled_at,found_at,extra_metadata,created_at,updated_at"
 )
 KNOWLEDGE_CHUNK_SELECT = (
     "id,instagram_account_id,text,type,source_url,page_path,title,"
@@ -52,6 +52,10 @@ CUSTOMER_PROFILE_SELECT = (
     "id,instagram_account_id,contact_id,phone_e164,display_name,first_redeemed_at,"
     "last_redeemed_at,redeem_count,last_order_notes,profile_summary,extra_metadata,"
     "created_at,updated_at"
+)
+COMMENT_CLASSIFICATION_SELECT = (
+    "id,comment_id,business_id,model,classification,confidence,reasoning,status,"
+    "error_message,classified_at"
 )
 
 
@@ -268,6 +272,19 @@ def insert_knowledge_chunk(row):
         "POST",
         "knowledge_chunks",
         params={"select": KNOWLEDGE_CHUNK_SELECT},
+        payload=row,
+        prefer="return=representation",
+    )
+    if not rows:
+        return None
+    return rows[0]
+
+
+def insert_comment_classification(row):
+    rows = _request(
+        "POST",
+        "ig_comment_classifications",
+        params={"select": COMMENT_CLASSIFICATION_SELECT},
         payload=row,
         prefer="return=representation",
     )
@@ -968,8 +985,8 @@ def get_instagram_post(instagram_account_id, instagram_media_id):
             "instagram_media_id": f"eq.{instagram_media_id}",
             "select": (
                 "id,instagram_account_id,instagram_media_id,caption,post_type,"
-                "automation_enabled,automation_starts_at,automation_ends_at,"
-                "trigger_keywords,comment_reply_text,dm_prompt,"
+                "automation_enabled,comment_trigger_mode,automation_starts_at,"
+                "automation_ends_at,trigger_keywords,comment_reply_text,dm_prompt,"
                 "promo_code_valid_duration_hours,promotion_metadata"
             ),
         },
@@ -1082,8 +1099,11 @@ def update_comment_automation(
     public_reply_comment_id=None,
     private_reply_message_id=None,
     automation_error=None,
+    matched_keyword=None,
 ):
     patch = {"automation_status": automation_status}
+    if matched_keyword:
+        patch["matched_keyword"] = matched_keyword
     if public_reply_comment_id:
         patch["public_reply_comment_id"] = public_reply_comment_id
         patch["replied_to"] = True

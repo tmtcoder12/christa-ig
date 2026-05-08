@@ -10,6 +10,13 @@ DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant responding to Instagram dir
 DEFAULT_FALLBACK_MESSAGE = "Thanks for your message — I'll get back to you shortly."
 MAX_HISTORY_MESSAGES = 20
 MAX_KNOWLEDGE_CHARS_PER_CHUNK = 900
+COMMENT_CLASSIFIER_SYSTEM_PROMPT = (
+    "Classify Instagram comments on restaurant promotional posts. "
+    "Trigger only for positive or neutral genuine restaurant/customer intent: menu, dietary, "
+    "hours, location, reservations, pricing, availability, purchase intent, or positive "
+    "experience comments. Do not trigger for complaints, negative feedback, spam, tag-only "
+    "comments, emoji-only comments, or unrelated text. Return only JSON."
+)
 LEAD_EXTRACTION_SYSTEM_PROMPT = (
     "Extract customer contact information from Instagram DMs. "
     "Return only JSON with keys customer_name and phone. Use null when missing."
@@ -32,6 +39,32 @@ def _serialize_usage(response):
         return usage
 
     return {}
+
+
+def _parse_json_object(raw_text):
+    text = (raw_text or "").strip()
+    if not text:
+        raise ValueError("Empty JSON response")
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        start = text.find("{")
+        end = text.rfind("}")
+        if start == -1 or end == -1 or end <= start:
+            raise
+        return json.loads(text[start : end + 1])
+
+
+def _coerce_bool(value):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "yes", "1"}:
+            return True
+        if normalized in {"false", "no", "0", ""}:
+            return False
+    return bool(value)
 
 
 def generate_query_embedding(text):
@@ -150,6 +183,77 @@ def generate_reply(history, system_prompt=None, knowledge_context=None):
             "response_id": None,
             "token_usage": {},
             "knowledge_context_count": knowledge_context_count,
+        }
+
+
+def classify_restaurant_comment_for_promo(comment_text, post_caption=None):
+    api_key = os.environ.get("OPENAI_API_KEY")
+    model = os.environ.get("COMMENT_CLASSIFIER_MODEL") or os.environ.get("OPENAI_MODEL", DEFAULT_MODEL)
+    if not api_key:
+        return {
+            "success": False,
+            "should_trigger": False,
+            "category": None,
+            "confidence": None,
+            "reasoning": None,
+            "error": "OPENAI_API_KEY is not set",
+            "model": model,
+            "response_id": None,
+            "token_usage": {},
+        }
+
+    client = OpenAI(api_key=api_key)
+    prompt = (
+        "Classify this Instagram comment for whether it should trigger a restaurant promo DM.\n\n"
+        f"Post caption: {post_caption or ''}\n"
+        f"Comment: {comment_text or ''}\n\n"
+        "Return compact JSON with exactly these keys:\n"
+        "- should_trigger: boolean\n"
+        "- category: one of dietary_question, menu_question, hours_location_question, "
+        "reservation_question, pricing_question, availability_question, purchase_intent, "
+        "positive_experience, general_restaurant_comment, spam_or_unrelated, complaint_or_negative\n"
+        "- confidence: number from 0 to 1\n"
+        "- reasoning: short phrase"
+    )
+
+    try:
+        response = client.responses.create(
+            model=model,
+            instructions=COMMENT_CLASSIFIER_SYSTEM_PROMPT,
+            input=[{"role": "user", "content": prompt}],
+        )
+        parsed = _parse_json_object(response.output_text)
+        if not isinstance(parsed, dict):
+            raise ValueError("Classifier response was not a JSON object")
+
+        confidence = parsed.get("confidence")
+        try:
+            confidence = float(confidence) if confidence is not None else None
+        except (TypeError, ValueError):
+            confidence = None
+
+        return {
+            "success": True,
+            "should_trigger": _coerce_bool(parsed.get("should_trigger")),
+            "category": parsed.get("category"),
+            "confidence": confidence,
+            "reasoning": parsed.get("reasoning"),
+            "error": None,
+            "model": model,
+            "response_id": getattr(response, "id", None),
+            "token_usage": _serialize_usage(response),
+        }
+    except Exception as exc:
+        return {
+            "success": False,
+            "should_trigger": False,
+            "category": None,
+            "confidence": None,
+            "reasoning": None,
+            "error": str(exc),
+            "model": model,
+            "response_id": None,
+            "token_usage": {},
         }
 
 

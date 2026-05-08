@@ -253,6 +253,11 @@ create table if not exists public.ig_posts (
     post_type = any (array['regular', 'promotional'])
   ),
   automation_enabled boolean not null default false,
+  comment_trigger_mode text not null default 'keywords' check (
+    comment_trigger_mode = any (
+      array['keywords', 'restaurant_intent', 'keywords_or_restaurant_intent']
+    )
+  ),
   automation_starts_at timestamp with time zone,
   automation_ends_at timestamp with time zone,
   trigger_keywords jsonb not null default '[]'::jsonb,
@@ -280,6 +285,11 @@ create table if not exists public.ig_promotion_setups (
   id uuid primary key default gen_random_uuid(),
   instagram_account_id uuid not null references public.instagram_accounts(id) on delete cascade,
   submitted_by uuid not null references public.profiles(id) on delete restrict,
+  comment_trigger_mode text not null default 'keywords' check (
+    comment_trigger_mode = any (
+      array['keywords', 'restaurant_intent', 'keywords_or_restaurant_intent']
+    )
+  ),
   trigger_keywords jsonb not null default '[]'::jsonb,
   automation_starts_at timestamp with time zone,
   automation_ends_at timestamp with time zone,

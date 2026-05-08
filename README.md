@@ -6,7 +6,7 @@ This repo is organized as a small monorepo:
 - `frontend-login/` contains the Vite React UI for authenticated business users.
 - `embeddings/` contains the CLI flow for embedding JSONL knowledge chunks and upserting them into Supabase.
 
-The backend Flask app receives Meta webhook requests on Render. It supports webhook verification, replies to inbound Instagram DMs with OpenAI-generated text, can trigger comment-to-DM automations on promotional posts, can send promo-code and follow-up SMS messages through Twilio, and can use Supabase `pgvector` knowledge chunks as RAG context.
+The backend Flask app receives Meta webhook requests on Render. It supports webhook verification, replies to inbound Instagram DMs with OpenAI-generated text, can trigger comment-to-DM automations on promotional posts from keywords or restaurant-intent comments, can send promo-code and follow-up SMS messages through Twilio, and can use Supabase `pgvector` knowledge chunks as RAG context.
 
 ## Endpoints
 
@@ -16,7 +16,7 @@ The backend Flask app receives Meta webhook requests on Render. It supports webh
 
 For inbound text `dm-related` webhook events, the app looks up the connected Instagram account in Supabase, persists the contact/session/messages, retrieves relevant `knowledge_chunks` for that Instagram account, generates a reply with OpenAI from database-backed chat history plus RAG context, stores the assistant reply, and sends the reply back to the message sender.
 
-For `comment-related` webhook events, promotional posts can be configured with trigger keywords. When a matching comment arrives, the app stores the comment, issues or reuses a unique promo code for that customer/post, sends a static public comment reply, creates a promo lead, and sends a private Instagram reply asking the commenter for their name and phone number. Once the customer provides those details in DM, the backend sends the promo code by Twilio SMS.
+For `comment-related` webhook events, promotional posts can be configured with trigger keywords, restaurant-intent comment classification, or both. When a qualifying comment arrives, the app stores the comment, issues or reuses a unique promo code for that customer/post, sends a static public comment reply, creates a promo lead, and sends a private Instagram reply asking the commenter for their name and phone number. Once the customer provides those details in DM, the backend sends the promo code by Twilio SMS.
 
 ## Environment variables
 
@@ -28,6 +28,8 @@ For `comment-related` webhook events, promotional posts can be configured with t
 - `FRONTEND_ORIGIN` optionally allows a deployed frontend origin for backend API CORS. Local dev allows `http://127.0.0.1:5173` and `http://localhost:5173` by default.
 - `OPENAI_API_KEY` is used to authenticate with OpenAI.
 - `OPENAI_MODEL` optionally overrides the default OpenAI model.
+- `COMMENT_CLASSIFIER_MODEL` optionally overrides the OpenAI model used to classify promotional post comments. Defaults to `OPENAI_MODEL`.
+- `COMMENT_CLASSIFIER_MIN_CONFIDENCE` optionally sets the minimum confidence for restaurant-intent comment triggers. Defaults to `0.65`.
 - `OPENAI_EMBEDDING_MODEL` optionally overrides the embedding model used for RAG queries. Defaults to `text-embedding-3-small`.
 - `OPENAI_SYSTEM_PROMPT` optionally overrides the default general assistant prompt when no account-specific prompt is provided.
 - `OPENAI_FALLBACK_MESSAGE` optionally overrides the fallback reply used when OpenAI fails.
@@ -115,13 +117,20 @@ python3 embeddings/embed-to-db.py embeddings/businessData/kosoo-chunks.jsonl 32
 
 ## Promotional comment automation
 
-To enable comment-to-DM automation for a post, mark an `ig_posts` row as promotional and set trigger keywords:
+To enable comment-to-DM automation for a post, mark an `ig_posts` row as promotional and choose a `comment_trigger_mode`:
+
+- `keywords` only triggers when the comment contains one of `trigger_keywords`.
+- `restaurant_intent` triggers when OpenAI classifies the comment as a positive/neutral genuine restaurant question or comment, such as dietary/menu questions, reservation/location/hours questions, purchase intent, or positive experience comments.
+- `keywords_or_restaurant_intent` checks keywords first, then uses restaurant-intent classification if no keyword matched.
+
+Existing promotional posts default to `keywords`.
 
 ```sql
 update public.ig_posts
 set
   post_type = 'promotional',
   automation_enabled = true,
+  comment_trigger_mode = 'keywords',
   automation_starts_at = now(),
   automation_ends_at = now() + interval '7 days',
   trigger_keywords = '["DM", "Test"]'::jsonb,
@@ -131,6 +140,8 @@ set
   promotion_metadata = '{"code_prefix": "KOSOO"}'::jsonb
 where instagram_media_id = 'YOUR_INSTAGRAM_MEDIA_ID';
 ```
+
+For an intent-only promotional post, set `comment_trigger_mode = 'restaurant_intent'` and leave `trigger_keywords = '[]'::jsonb`. Classification results are stored in `ig_comment_classifications`; classifier failures fail closed and do not send a public reply, DM, or promo code.
 
 Automation is limited to one attempted DM per `post_id` and `contact_id`. The app only sends the public reply and private DM while the optional automation window is active:
 
@@ -180,7 +191,7 @@ FOLLOWUP_CRON_SECRET=the-same-secret-used-by-your-backend
 
 The cron service is separate from the web service, so it does not automatically know the backend URL unless `BACKEND_URL` is set.
 
-The `frontend-login` Add Promotion page creates a pending `ig_promotion_setups` row through `POST /api/promotions`. The backend snapshots the selected account's existing `ig_posts.instagram_media_id` values, polls Instagram media every 30 seconds for up to 5 minutes, and turns the newest unseen media item into a promotional `ig_posts` row. Only one pending/polling setup can exist per Instagram account.
+The `frontend-login` Add Promotion page creates a pending `ig_promotion_setups` row through `POST /api/promotions`. The form includes the promotion trigger mode, trigger keywords when needed, automation window, promo-code validity duration, comment reply text, DM prompt, and code prefix. The backend snapshots the selected account's existing `ig_posts.instagram_media_id` values, polls Instagram media every 30 seconds for up to 5 minutes, and turns the newest unseen media item into a promotional `ig_posts` row. Only one pending/polling setup can exist per Instagram account.
 
 ## Run locally
 
@@ -250,7 +261,7 @@ Open your service in Render and check the **Logs** tab to see:
 - verification attempts
 - detected event type (`comment-related`, `dm-related`, or `unknown`)
 - processing results such as `replied`, `fallback_sent`, `duplicate_dm_ignored`, `instagram_account_not_configured`, `skipped_echo`, or `skipped_read_receipt`
-- comment automation results such as `comment_automation_sent`, `comment_no_keyword_match`, `comment_duplicate_automation`, `comment_public_reply_failed`, or `comment_private_reply_failed`
+- comment automation results such as `comment_automation_sent`, `comment_no_keyword_match`, `comment_no_restaurant_intent_match`, `comment_classifier_failed`, `comment_duplicate_automation`, `comment_public_reply_failed`, or `comment_private_reply_failed`
 - full webhook payloads
 - the Supabase IDs for the business, Instagram account, contact, session, and messages
 - the OpenAI generation result, including how many RAG knowledge chunks were included
