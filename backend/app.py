@@ -17,6 +17,8 @@ from openai_client import (
     extract_lead_contact_info,
     generate_query_embedding,
     generate_reply,
+    generate_redemption_followup_sms,
+    generate_restaurant_intent_promo_messages,
 )
 from supabase_client import (
     SupabaseError,
@@ -93,6 +95,7 @@ PROMOTION_POLL_TIMEOUT_SECONDS = 5 * 60
 SMS_STOP_WORDS = {"STOP", "STOPALL", "UNSUBSCRIBE", "CANCEL", "END", "QUIT"}
 SMS_REPLY_TARGET_CHARS = 320
 MAX_SMS_BODY_CHARS = 700
+MAX_PUBLIC_COMMENT_REPLY_CHARS = 220
 COMMENT_TRIGGER_KEYWORDS = "keywords"
 COMMENT_TRIGGER_RESTAURANT_INTENT = "restaurant_intent"
 COMMENT_TRIGGER_KEYWORDS_OR_INTENT = "keywords_or_restaurant_intent"
@@ -620,6 +623,54 @@ def resolve_comment_automation_trigger(comment_text, post, instagram_account, co
 
 def build_lead_capture_dm_text():
     return "Thanks! Reply with your name and phone number and we'll text you the promo code."
+
+
+def ensure_dm_mention_in_comment_reply(text):
+    normalized = enforce_sms_body_limit(text, max_chars=MAX_PUBLIC_COMMENT_REPLY_CHARS)
+    if re.search(r"\b(dm|dms|direct message|inbox)\b", normalized, flags=re.IGNORECASE):
+        return normalized
+
+    suffix = " Check DMs."
+    max_base_chars = MAX_PUBLIC_COMMENT_REPLY_CHARS - len(suffix)
+    base = enforce_sms_body_limit(normalized, max_chars=max_base_chars).rstrip(".! ")
+    return f"{base}.{suffix}".strip()
+
+
+def build_restaurant_intent_promo_copy(
+    instagram_account,
+    post,
+    comment_text,
+    matched_trigger,
+    code_prefix=None,
+):
+    fallback_public_reply = ensure_dm_mention_in_comment_reply(post.get("comment_reply_text") or "Sent you a DM!")
+    fallback_private_dm = build_lead_capture_dm_text()
+    rag_result = retrieve_knowledge_context(instagram_account["id"], comment_text)
+    started_at = time.perf_counter()
+    generated = generate_restaurant_intent_promo_messages(
+        comment_text=comment_text,
+        post_caption=post.get("caption"),
+        dm_prompt=post.get("dm_prompt"),
+        matched_trigger=matched_trigger,
+        code_prefix=code_prefix,
+        system_prompt=instagram_account.get("system_prompt"),
+        knowledge_context=rag_result["chunks"],
+    )
+    latency_ms = int((time.perf_counter() - started_at) * 1000)
+    public_reply = fallback_public_reply
+    private_dm = fallback_private_dm
+    if generated.get("success"):
+        public_reply = ensure_dm_mention_in_comment_reply(generated.get("public_comment_reply"))
+        private_dm = generated.get("private_dm") or fallback_private_dm
+
+    return {
+        "public_reply": public_reply,
+        "private_dm": private_dm,
+        "generation": generated,
+        "latency_ms": latency_ms,
+        "rag": rag_result,
+        "used_fallback": not generated.get("success"),
+    }
 
 
 def build_missing_lead_fields_reply(has_name, has_phone):
@@ -1666,6 +1717,33 @@ def process_comment_with_database(comment_info, payload, event_type):
         prefix=code_prefix,
         valid_duration_hours=post.get("promo_code_valid_duration_hours"),
     )
+    promo_copy = None
+    public_reply_text = post.get("comment_reply_text") or "Sent you a DM!"
+    private_reply_text = build_lead_capture_dm_text()
+    if trigger_result.get("trigger_source") == "restaurant_intent":
+        promo_copy = build_restaurant_intent_promo_copy(
+            instagram_account,
+            post,
+            comment_text,
+            matched_trigger,
+            code_prefix=code_prefix,
+        )
+        public_reply_text = promo_copy["public_reply"]
+        private_reply_text = promo_copy["private_dm"]
+
+    copy_generation = (promo_copy or {}).get("generation") or {}
+    rag_result = (promo_copy or {}).get("rag") or {"enabled": False, "chunks": [], "error": None}
+    copy_metadata = {
+        "copy_mode": "llm_restaurant_intent" if promo_copy else "static_keyword",
+        "copy_used_fallback": bool((promo_copy or {}).get("used_fallback")),
+        "copy_model": copy_generation.get("model"),
+        "copy_response_id": copy_generation.get("response_id"),
+        "copy_error": copy_generation.get("error"),
+        "copy_latency_ms": (promo_copy or {}).get("latency_ms"),
+        "rag_enabled": rag_result.get("enabled"),
+        "rag_match_count": len(rag_result.get("chunks") or []),
+        "rag_error": rag_result.get("error"),
+    }
     promo_lead = ensure_promo_lead(
         instagram_account["id"],
         post["id"],
@@ -1679,6 +1757,7 @@ def process_comment_with_database(comment_info, payload, event_type):
             "classification_id": (
                 trigger_result.get("classification_row") or {}
             ).get("id"),
+            **copy_metadata,
             "source": "comment_to_dm",
         },
     )
@@ -1687,12 +1766,11 @@ def process_comment_with_database(comment_info, payload, event_type):
 
     public_reply_response = reply_to_instagram_comment(
         comment_id,
-        post.get("comment_reply_text") or "Sent you a DM!",
+        public_reply_text,
     )
     public_reply_id = get_sent_instagram_message_id(public_reply_response)
     public_error = None if public_reply_response["success"] else public_reply_response.get("error")
 
-    private_reply_text = build_lead_capture_dm_text()
     private_reply_response = send_instagram_private_reply(comment_id, private_reply_text)
     private_reply_id = get_sent_instagram_message_id(private_reply_response)
     private_error = None if private_reply_response["success"] else private_reply_response.get("error")
@@ -1708,6 +1786,21 @@ def process_comment_with_database(comment_info, payload, event_type):
         content=private_reply_text,
         instagram_message_id=private_reply_id,
         delivery_status=delivery_status,
+        model=copy_generation.get("model"),
+        query_type="restaurant_intent_promo_dm" if promo_copy else None,
+        sources={
+            "trigger_source": trigger_result.get("trigger_source"),
+            "matched_trigger": matched_trigger,
+            "classification_id": (
+                trigger_result.get("classification_row") or {}
+            ).get("id"),
+            "knowledge_context_count": len(rag_result.get("chunks") or []),
+            "rag_error": rag_result.get("error"),
+            "copy_response_id": copy_generation.get("response_id"),
+            "copy_used_fallback": bool((promo_copy or {}).get("used_fallback")),
+        } if promo_copy else None,
+        token_usage=copy_generation.get("token_usage"),
+        latency_ms=(promo_copy or {}).get("latency_ms"),
         error_message=automation_error,
     )
 
@@ -1740,7 +1833,7 @@ def process_comment_with_database(comment_info, payload, event_type):
 
     return {
         "processing_result": processing_result,
-        "openai_result": None,
+        "openai_result": copy_generation or None,
         "public_reply_response": public_reply_response,
         "private_reply_response": private_reply_response,
         "db_result": {
@@ -1762,6 +1855,13 @@ def process_comment_with_database(comment_info, payload, event_type):
             "classification_id": (
                 trigger_result.get("classification_row") or {}
             ).get("id"),
+            "copy_mode": copy_metadata["copy_mode"],
+            "copy_used_fallback": copy_metadata["copy_used_fallback"],
+            "rag": {
+                "enabled": rag_result.get("enabled"),
+                "match_count": len(rag_result.get("chunks") or []),
+                "error": rag_result.get("error"),
+            },
         },
     }
 
@@ -2339,19 +2439,28 @@ def schedule_sms_redemption_followup(promo_code, customer_profile=None, redempti
     redeemed_at = parse_iso_datetime(promo_code.get("redeemed_at")) or datetime.now(timezone.utc)
     delay_minutes = parse_int_env("FOLLOWUP_DELAY_MINUTES", 10)
     scheduled_for = redeemed_at + timedelta(minutes=delay_minutes)
+    account = get_instagram_account_by_id(promo_code["instagram_account_id"])
+    followup_generation = generate_redemption_followup_sms(
+        promo_code,
+        display_name=display_name,
+        redemption_notes=redemption_notes,
+        last_order_notes=(customer_profile or {}).get("last_order_notes") if redemption_notes else None,
+        profile_summary=(customer_profile or {}).get("profile_summary") if redemption_notes else None,
+        system_prompt=(account or {}).get("system_prompt"),
+    )
+    fallback_body = build_personalized_sms_followup_body(
+        promo_code,
+        redemption_notes=redemption_notes,
+        display_name=display_name,
+    )
+    followup_body = followup_generation.get("body") if followup_generation.get("success") else fallback_body
     sms_row = {
         "instagram_account_id": promo_code["instagram_account_id"],
         "contact_id": promo_code["contact_id"],
         "promo_code_id": promo_code["id"],
         "promo_lead_id": (lead or {}).get("id"),
         "to_phone_e164": phone_e164,
-        "body": enforce_sms_body_limit(
-            build_personalized_sms_followup_body(
-                promo_code,
-                redemption_notes=redemption_notes,
-                display_name=display_name,
-            )
-        ),
+        "body": enforce_sms_body_limit(followup_body),
         "purpose": "post_redemption_followup",
         "status": "pending",
         "scheduled_for": scheduled_for.isoformat(),
@@ -2361,6 +2470,12 @@ def schedule_sms_redemption_followup(promo_code, customer_profile=None, redempti
             **({"customer_profile_id": customer_profile.get("id")} if customer_profile else {}),
             **({"display_name_used": display_name} if display_name else {}),
             **({"redemption_notes_used": True} if redemption_notes else {}),
+            "copy_mode": "llm_followup_sms",
+            "copy_used_fallback": not followup_generation.get("success"),
+            "copy_model": followup_generation.get("model"),
+            "copy_response_id": followup_generation.get("response_id"),
+            "copy_error": followup_generation.get("error"),
+            "copy_token_usage": followup_generation.get("token_usage") or {},
         },
     }
     try:

@@ -1152,6 +1152,8 @@ def insert_dm_message(
     delivery_status="complete",
     created_at=None,
     model=None,
+    query_type=None,
+    sources=None,
     token_usage=None,
     latency_ms=None,
     error_message=None,
@@ -1172,6 +1174,10 @@ def insert_dm_message(
         row["created_at"] = created_at
     if model:
         row["model"] = model
+    if query_type:
+        row["query_type"] = query_type
+    if sources is not None:
+        row["sources"] = sources
     if latency_ms is not None:
         row["latency_ms"] = latency_ms
     if error_message:

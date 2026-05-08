@@ -16,7 +16,7 @@ The backend Flask app receives Meta webhook requests on Render. It supports webh
 
 For inbound text `dm-related` webhook events, the app looks up the connected Instagram account in Supabase, persists the contact/session/messages, retrieves relevant `knowledge_chunks` for that Instagram account, generates a reply with OpenAI from database-backed chat history plus RAG context, stores the assistant reply, and sends the reply back to the message sender.
 
-For `comment-related` webhook events, promotional posts can be configured with trigger keywords, restaurant-intent comment classification, or both. When a qualifying comment arrives, the app stores the comment, issues or reuses a unique promo code for that customer/post, sends a static public comment reply, creates a promo lead, and sends a private Instagram reply asking the commenter for their name and phone number. Once the customer provides those details in DM, the backend sends the promo code by Twilio SMS.
+For `comment-related` webhook events, promotional posts can be configured with trigger keywords, restaurant-intent comment classification, or both. When a qualifying comment arrives, the app stores the comment, issues or reuses a unique promo code for that customer/post, sends a public comment reply, creates a promo lead, and sends a private Instagram reply asking the commenter for their name and phone number. Restaurant-intent triggers use RAG-aware OpenAI copy for the public comment and private DM; keyword triggers keep the configured static comment reply and lead-capture DM. Once the customer provides their details in DM, the backend sends the promo code by Twilio SMS.
 
 ## Environment variables
 
@@ -141,7 +141,7 @@ set
 where instagram_media_id = 'YOUR_INSTAGRAM_MEDIA_ID';
 ```
 
-For an intent-only promotional post, set `comment_trigger_mode = 'restaurant_intent'` and leave `trigger_keywords = '[]'::jsonb`. Classification results are stored in `ig_comment_classifications`; classifier failures fail closed and do not send a public reply, DM, or promo code.
+For an intent-only promotional post, set `comment_trigger_mode = 'restaurant_intent'` and leave `trigger_keywords = '[]'::jsonb`. Classification results are stored in `ig_comment_classifications`; classifier failures fail closed and do not send a public reply, DM, or promo code. When a restaurant-intent comment qualifies, the backend retrieves relevant `knowledge_chunks`, generates a short public reply that mentions DMs, and generates a private DM that answers the comment before asking for name and phone. If OpenAI generation fails, the flow falls back to the configured `comment_reply_text` and the standard lead-capture DM.
 
 Automation is limited to one attempted DM per `post_id` and `contact_id`. The app only sends the public reply and private DM while the optional automation window is active:
 
@@ -171,7 +171,7 @@ Promo code validity is controlled by `promo_code_valid_duration_hours` on the po
 - Expiration is checked from `ig_promo_codes.expires_at`; when webhook traffic is processed, issued codes with `expires_at < now()` are marked `expired`.
 - `status = 'expired'` means the validity window has passed; `redeemed` means the code was used; `void` means an admin/manual flow invalidated it.
 
-When a staff user redeems a promo code through the `frontend-login` Redeem page, the backend creates one durable `ig_sms_messages` row for that promo code with `purpose = 'post_redemption_followup'`. By default, the follow-up SMS is scheduled for 10 minutes after `ig_promo_codes.redeemed_at` and is sent to the phone number collected for the promo lead.
+When a staff user redeems a promo code through the `frontend-login` Redeem page, the backend creates one durable `ig_sms_messages` row for that promo code with `purpose = 'post_redemption_followup'`. By default, the follow-up SMS is scheduled for 10 minutes after `ig_promo_codes.redeemed_at` and is sent to the phone number collected for the promo lead. The message body is generated with OpenAI using the customer name and any staff redemption notes; if generation fails, the backend falls back to the existing generic/template follow-up body.
 
 Follow-ups are not sent by an in-memory timer. Run the due-message processor from a cron service such as Render Cron or Supabase cron:
 
