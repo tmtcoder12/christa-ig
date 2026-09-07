@@ -92,24 +92,24 @@ function ShellContent() {
             <section className="empty-state">
               <h1>No business access</h1>
               <p>
-                Your user is signed in, but it is not linked to a business yet. Add this profile to
-                `business_users` in Supabase to unlock business and Instagram account data.
+                Your user is signed in, but it is not linked to a business yet. Add this profile to `business_users` in
+                Supabase to unlock business and Instagram account data.
               </p>
             </section>
           ) : null}
           {!loading && businesses.length && !instagramAccounts.length ? (
             <section className="empty-state">
               <h1>No Instagram accounts</h1>
-              <p>
-                {selectedBusiness?.name || 'This business'} has no Instagram accounts available to this user yet.
-              </p>
+              <p>{selectedBusiness?.name || 'This business'} has no Instagram accounts available to this user yet.</p>
             </section>
           ) : null}
           {businesses.length && instagramAccounts.length ? (
             <>
               <div className="context-strip">
                 <span>{selectedBusiness?.name || selectedBusiness?.slug || 'Business selected'}</span>
-                <span>{selectedInstagramAccount?.username ? `@${selectedInstagramAccount.username}` : 'IG selected'}</span>
+                <span>
+                  {selectedInstagramAccount?.username ? `@${selectedInstagramAccount.username}` : 'IG selected'}
+                </span>
               </div>
               <Outlet />
             </>

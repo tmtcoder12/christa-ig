@@ -61,9 +61,7 @@ export function AccountProvider({ children }: { children: ReactNode }) {
     setBusinesses(nextBusinesses);
 
     setSelectedBusinessId((current) =>
-      current && nextBusinesses.some((business) => business.id === current)
-        ? current
-        : nextBusinesses[0]?.id ?? '',
+      current && nextBusinesses.some((business) => business.id === current) ? current : (nextBusinesses[0]?.id ?? ''),
     );
     setLoading(false);
   }, [user]);
@@ -107,9 +105,7 @@ export function AccountProvider({ children }: { children: ReactNode }) {
         const nextAccounts = data ?? [];
         setInstagramAccounts(nextAccounts);
         setSelectedInstagramAccountId((current) =>
-          current && nextAccounts.some((account) => account.id === current)
-            ? current
-            : nextAccounts[0]?.id ?? '',
+          current && nextAccounts.some((account) => account.id === current) ? current : (nextAccounts[0]?.id ?? ''),
         );
         setLoading(false);
       });

@@ -194,7 +194,10 @@ export function Knowledge() {
         {selectedInstagramAccount ? (
           <p className="inline-state">
             New chunks will be embedded for{' '}
-            {selectedInstagramAccount.username ? `@${selectedInstagramAccount.username}` : selectedInstagramAccount.name}.
+            {selectedInstagramAccount.username
+              ? `@${selectedInstagramAccount.username}`
+              : selectedInstagramAccount.name}
+            .
           </p>
         ) : null}
 
@@ -212,7 +215,12 @@ export function Knowledge() {
             <p className="eyebrow">Chunks</p>
             <h2>{loading ? 'Loading' : `${chunks.length} shown`}</h2>
           </div>
-          <button type="button" className="secondary-button" onClick={() => loadChunks()} disabled={loading || !selectedInstagramAccountId}>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => loadChunks()}
+            disabled={loading || !selectedInstagramAccountId}
+          >
             Refresh
           </button>
         </div>
@@ -255,7 +263,9 @@ export function Knowledge() {
           </label>
         </div>
 
-        {!loading && !chunks.length ? <p className="inline-state">No knowledge chunks found for this Instagram account.</p> : null}
+        {!loading && !chunks.length ? (
+          <p className="inline-state">No knowledge chunks found for this Instagram account.</p>
+        ) : null}
 
         {chunks.length ? (
           <div className="knowledge-grid">

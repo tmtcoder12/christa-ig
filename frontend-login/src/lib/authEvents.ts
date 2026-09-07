@@ -7,7 +7,7 @@ function getClientInfo() {
   return {
     user_agent: navigator.userAgent,
     language: navigator.language,
-    languages: navigator.languages,
+    languages: Array.from(navigator.languages),
     platform: navigator.platform,
     timezone: Intl.DateTimeFormat().resolvedOptions().timeZone,
     screen: {

@@ -168,20 +168,12 @@ export function AddPromotion() {
 
           <label>
             Promo code prefix
-            <input
-              value={codePrefix}
-              onChange={(event) => setCodePrefix(event.target.value)}
-              placeholder="KOSOO"
-            />
+            <input value={codePrefix} onChange={(event) => setCodePrefix(event.target.value)} placeholder="KOSOO" />
           </label>
 
           <label className="full-width-field">
             Comment reply text
-            <input
-              value={commentReplyText}
-              onChange={(event) => setCommentReplyText(event.target.value)}
-              required
-            />
+            <input value={commentReplyText} onChange={(event) => setCommentReplyText(event.target.value)} required />
           </label>
 
           <label className="full-width-field">
@@ -198,7 +190,10 @@ export function AddPromotion() {
         {selectedInstagramAccount ? (
           <p className="inline-state">
             Polling will watch for the next unseen post from{' '}
-            {selectedInstagramAccount.username ? `@${selectedInstagramAccount.username}` : selectedInstagramAccount.name}.
+            {selectedInstagramAccount.username
+              ? `@${selectedInstagramAccount.username}`
+              : selectedInstagramAccount.name}
+            .
           </p>
         ) : null}
 

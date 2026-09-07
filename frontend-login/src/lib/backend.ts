@@ -8,22 +8,91 @@ import type {
   RedeemPromoCodeInput,
   RedeemPromoCodeResponse,
 } from '../types';
+import { clientEnvironment } from './env';
 
-const backendUrl = (import.meta.env.VITE_BACKEND_URL as string | undefined) || 'http://127.0.0.1:5000';
+const REQUEST_TIMEOUT_MS = 10_000;
+const SAFE_RETRY_DELAYS_MS = [250, 750];
 
-async function apiRequest<T>(path: string, accessToken: string, options: RequestInit = {}): Promise<T> {
-  const response = await fetch(`${backendUrl}${path}`, {
-    ...options,
-    headers: {
-      'Content-Type': 'application/json',
-      Authorization: `Bearer ${accessToken}`,
-      ...(options.headers || {}),
-    },
-  });
+type ErrorPayload = {
+  error?: string;
+  code?: string;
+  request_id?: string;
+};
 
-  const payload = await response.json().catch(() => ({}));
+export class ApiError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+    readonly code: string,
+    readonly requestId: string | null,
+  ) {
+    super(message);
+    this.name = 'ApiError';
+  }
+}
+
+function sleep(delayMs: number) {
+  return new Promise((resolve) => window.setTimeout(resolve, delayMs));
+}
+
+function shouldRetry(status: number) {
+  return status === 408 || status === 429 || status === 502 || status === 503 || status === 504;
+}
+
+async function sendRequest(path: string, accessToken: string, options: RequestInit): Promise<Response> {
+  const controller = new AbortController();
+  const timeoutId = window.setTimeout(() => controller.abort(), REQUEST_TIMEOUT_MS);
+  try {
+    return await fetch(`${clientEnvironment.backendUrl}${path}`, {
+      ...options,
+      signal: controller.signal,
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${accessToken}`,
+        ...(options.headers || {}),
+      },
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === 'AbortError') {
+      throw new ApiError('The server took too long to respond.', 0, 'request_timeout', null);
+    }
+    throw error;
+  } finally {
+    window.clearTimeout(timeoutId);
+  }
+}
+
+export async function apiRequest<T>(path: string, accessToken: string, options: RequestInit = {}): Promise<T> {
+  const method = (options.method || 'GET').toUpperCase();
+  const maxRetries = method === 'GET' ? SAFE_RETRY_DELAYS_MS.length : 0;
+  let response: Response | null = null;
+
+  for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+    try {
+      response = await sendRequest(path, accessToken, options);
+      if (!shouldRetry(response.status) || attempt === maxRetries) {
+        break;
+      }
+    } catch (error) {
+      if (attempt === maxRetries || (error instanceof ApiError && error.code !== 'request_timeout')) {
+        throw error;
+      }
+    }
+    await sleep(SAFE_RETRY_DELAYS_MS[attempt]);
+  }
+
+  if (!response) {
+    throw new ApiError('Unable to reach the server.', 0, 'network_error', null);
+  }
+
+  const payload = (await response.json().catch(() => ({}))) as ErrorPayload;
   if (!response.ok) {
-    throw new Error(payload.error || `Request failed with status ${response.status}`);
+    throw new ApiError(
+      payload.error || `Request failed with status ${response.status}`,
+      response.status,
+      payload.code || 'request_failed',
+      payload.request_id || response.headers.get('X-Request-ID'),
+    );
   }
   return payload as T;
 }

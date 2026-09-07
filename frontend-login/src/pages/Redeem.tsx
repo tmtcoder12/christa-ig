@@ -129,7 +129,10 @@ export function Redeem() {
         {selectedInstagramAccount ? (
           <p className="inline-state">
             Redeeming against{' '}
-            {selectedInstagramAccount.username ? `@${selectedInstagramAccount.username}` : selectedInstagramAccount.name}.
+            {selectedInstagramAccount.username
+              ? `@${selectedInstagramAccount.username}`
+              : selectedInstagramAccount.name}
+            .
           </p>
         ) : (
           <p className="inline-state">Select an Instagram account before redeeming a code.</p>

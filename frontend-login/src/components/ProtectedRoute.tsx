@@ -1,6 +1,6 @@
 import { Navigate, Outlet, useLocation } from 'react-router-dom';
 import { useAuth } from '../lib/auth';
-import { hasSupabaseConfig } from '../lib/supabase';
+import { hasSupabaseConfig, supabaseConfigErrors } from '../lib/supabase';
 
 export function ProtectedRoute() {
   const { user, loading } = useAuth();
@@ -11,7 +11,8 @@ export function ProtectedRoute() {
       <main className="state-page">
         <section className="state-panel">
           <h1>Supabase is not configured</h1>
-          <p>Create `frontend-login/.env.local` with `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY`.</p>
+          <p>Create `frontend-login/.env.local` with valid `VITE_SUPABASE_URL` and `VITE_SUPABASE_ANON_KEY` values.</p>
+          {supabaseConfigErrors.length ? <p>{supabaseConfigErrors.join('. ')}</p> : null}
         </section>
       </main>
     );
