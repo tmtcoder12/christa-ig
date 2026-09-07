@@ -1,268 +1,181 @@
-# Christa IG Monorepo
+# Christa IG
 
-This repo is organized as a small monorepo:
+Christa IG helps a business turn Instagram conversations into useful customer interactions.
 
-- `backend/` contains the Flask webhook/API service, Supabase schema, and backend Python dependencies.
-- `frontend-login/` contains the Vite React UI for authenticated business users.
-- `embeddings/` contains the CLI flow for embedding JSONL knowledge chunks and upserting them into Supabase.
+It can answer direct messages using the business's own information, react to comments on promotional posts, collect customer details, send promo codes by text message, and help staff redeem those codes.
 
-The backend Flask app receives Meta webhook requests on Render. It supports webhook verification, replies to inbound Instagram DMs with OpenAI-generated text, can trigger comment-to-DM automations on promotional posts from keywords or restaurant-intent comments, can send promo-code and follow-up SMS messages through Twilio, and can use Supabase `pgvector` knowledge chunks as RAG context.
+The project was first built for restaurants, but most of it can also support businesses such as:
 
-## Endpoints
+- Gyms answering membership questions and promoting trial passes
+- Online shops answering product questions and sending discount codes
+- Salons collecting leads for seasonal offers
+- Local services answering common questions and following up with customers
+- Events and venues promoting tickets or special packages
 
-- `GET /` returns a healthcheck response.
-- `GET /webhook` handles Meta webhook verification.
-- `POST /webhook` processes Instagram webhook events and returns a fast `200 OK`.
+The current AI comment classifier is written for restaurant conversations. Other businesses can use keyword-based promotions immediately. The classifier prompt can also be changed for another industry.
 
-For inbound text `dm-related` webhook events, the app looks up the connected Instagram account in Supabase, persists the contact/session/messages, retrieves relevant `knowledge_chunks` for that Instagram account, generates a reply with OpenAI from database-backed chat history plus RAG context, stores the assistant reply, and sends the reply back to the message sender.
+## What it can do
 
-For `comment-related` webhook events, promotional posts can be configured with trigger keywords, restaurant-intent comment classification, or both. When a qualifying comment arrives, the app stores the comment, issues or reuses a unique promo code for that customer/post, sends a public comment reply, creates a promo lead, and sends a private Instagram reply asking the commenter for their name and phone number. Restaurant-intent triggers use RAG-aware OpenAI copy for the public comment and private DM; keyword triggers keep the configured static comment reply and lead-capture DM. Once the customer provides their details in DM, the backend sends the promo code by Twilio SMS.
+- Reply to Instagram direct messages with AI
+- Use business-specific facts, policies, products, menus, or FAQs when writing replies
+- Start a promotion when a comment contains a chosen keyword
+- Recognize restaurant-related questions and buying interest with AI
+- Reply publicly and send a private Instagram message
+- Collect a customer's name and phone number through direct messages
+- Create one unique promo code for each customer and promotion
+- Send promo codes and follow-up messages through Twilio SMS
+- Let staff create promotions, manage knowledge, and redeem codes in a web dashboard
+- Keep each business's data separate with Supabase authentication and access rules
 
-## Environment variables
+## How it works
 
-- `META_VERIFY_TOKEN` is the verify token you will also enter in the Meta developer dashboard.
-- `INSTAGRAM_ACCESS_TOKEN` is the access token used to send Instagram DM replies through the Meta Graph API.
-- `SUPABASE_URL` is your Supabase project URL.
-- `SUPABASE_SERVICE_ROLE_KEY` is used by the backend webhook to insert and update tenant data. Keep this server-side only.
-- `SUPABASE_ANON_KEY` is used by backend API routes to verify Supabase Auth bearer tokens from the frontend.
-- `FRONTEND_ORIGIN` optionally allows a deployed frontend origin for backend API CORS. Local dev allows `http://127.0.0.1:5173` and `http://localhost:5173` by default.
-- `OPENAI_API_KEY` is used to authenticate with OpenAI.
-- `OPENAI_MODEL` optionally overrides the default OpenAI model.
-- `COMMENT_CLASSIFIER_MODEL` optionally overrides the OpenAI model used to classify promotional post comments. Defaults to `OPENAI_MODEL`.
-- `COMMENT_CLASSIFIER_MIN_CONFIDENCE` optionally sets the minimum confidence for restaurant-intent comment triggers. Defaults to `0.65`.
-- `OPENAI_EMBEDDING_MODEL` optionally overrides the embedding model used for RAG queries. Defaults to `text-embedding-3-small`.
-- `OPENAI_SYSTEM_PROMPT` optionally overrides the default general assistant prompt when no account-specific prompt is provided.
-- `OPENAI_FALLBACK_MESSAGE` optionally overrides the fallback reply used when OpenAI fails.
-- `RAG_ENABLED` optionally enables or disables knowledge retrieval. Defaults to `true`.
-- `RAG_MATCH_COUNT` optionally sets how many knowledge chunks are sent to OpenAI. Defaults to `5`.
-- `FOLLOWUP_CRON_SECRET` protects the follow-up processor endpoint.
-- `FOLLOWUP_DELAY_MINUTES` optionally sets the delay between promo-code redemption and the follow-up SMS. Defaults to `10`.
-- `FOLLOWUP_BATCH_SIZE` optionally sets how many due follow-ups one processor call handles. Defaults to `20`.
-- `TWILIO_ACCOUNT_SID` is the Twilio account SID used for SMS delivery.
-- `TWILIO_AUTH_TOKEN` is the Twilio auth token used for SMS delivery. Keep this server-side only.
-- `TWILIO_MESSAGING_SERVICE_SID` is the Twilio Messaging Service SID used as the SMS sender.
-- `TWILIO_VALIDATE_SIGNATURE` optionally controls Twilio webhook signature validation. Defaults to `true`; set to `false` only for local/manual webhook testing.
-- `PORT` is provided by Render automatically.
+The project has three parts:
 
-The `frontend-login` Vite app also uses browser-safe frontend env vars:
+- `frontend-login/`: the React staff dashboard
+- `backend/`: the Flask API and webhook service
+- `embeddings/`: a tool for loading larger amounts of business knowledge
+
+Instagram and Twilio send new events to the backend. The backend stores them in Supabase, asks OpenAI for help when needed, and sends the response back through Instagram or SMS.
+
+For more detail, see:
+
+- [Backend guide](backend/README.md)
+- [Frontend guide](frontend-login/README.md)
+- [Embedding guide](embeddings/README-embeddings.md)
+
+## What you need
+
+- Python 3.10 or newer
+- Node.js 20.19+ or 22.12+
+- A Supabase project
+- An OpenAI API key
+- A Meta app and a connected professional Instagram account
+- A Twilio account if you want SMS features
+- A public HTTPS address for receiving webhooks in production
+
+## Setup
+
+### 1. Create the database
+
+Create a Supabase project. Open its SQL editor and run:
+
+```text
+backend/database/schema.sql
+```
+
+This creates the tables, access rules, and vector search function used by the app.
+
+### 2. Create your first account records
+
+Create a user in Supabase Authentication and note its user ID. Then use the Supabase SQL editor to create:
+
+1. A matching row in `profiles`
+2. A row in `businesses`
+3. A row in `business_users` that links your Supabase user ID to that business with the `owner` role
+4. A row in `instagram_accounts` that links the business to its Instagram account
+
+You can also create the user with the frontend sign-up page after completing its setup below; that path creates the `profiles` row for you. The dashboard does not create the remaining business records yet. The `instagram_user_id` must be the ID Meta sends as `entry.id`, not the username.
+
+### 3. Configure the backend
+
+Create `backend/.env`:
+
+```env
+META_VERIFY_TOKEN=choose-a-private-verification-token
+INSTAGRAM_ACCESS_TOKEN=your-instagram-access-token
+
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+SUPABASE_ANON_KEY=your-anon-key
+
+OPENAI_API_KEY=your-openai-api-key
+
+TWILIO_ACCOUNT_SID=your-twilio-account-sid
+TWILIO_AUTH_TOKEN=your-twilio-auth-token
+TWILIO_MESSAGING_SERVICE_SID=your-messaging-service-sid
+
+FOLLOWUP_CRON_SECRET=choose-another-private-token
+FRONTEND_ORIGIN=http://localhost:5173
+```
+
+Twilio values are only required for SMS features. Never put the service-role key or other private keys in the frontend.
+
+Create and run the backend:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r backend/requirements.txt
+
+set -a
+source backend/.env
+set +a
+
+python backend/app.py
+```
+
+Check that it is running:
+
+```bash
+curl http://127.0.0.1:5000/
+```
+
+You should receive `{"status":"ok"}`.
+
+### 4. Configure the frontend
+
+Create `frontend-login/.env.local` and fill in:
 
 ```env
 VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_ANON_KEY=your-public-anon-key
+VITE_SUPABASE_ANON_KEY=your-anon-key
 VITE_BACKEND_URL=http://127.0.0.1:5000
-```
-
-## Supabase setup
-
-Run the schema in `backend/database/schema.sql` in your Supabase SQL editor or with `psql`. The schema enables `pgcrypto` and `vector`, creates the Instagram/DM/comment tables, creates `knowledge_chunks`, and defines the `match_knowledge_chunks(...)` RPC used by RAG.
-
-Before the webhook can persist a DM, the receiving Instagram account must exist in `instagram_accounts`. In Meta DM webhooks, `entry.id` is your business Instagram account ID and `messaging[].sender.id` is the contact. For example, with this payload:
-
-```json
-{
-  "entry": [
-    {
-      "id": "17841476354816630",
-      "messaging": [
-        {
-          "sender": {
-            "id": "25391124670525123"
-          }
-        }
-      ]
-    }
-  ]
-}
-```
-
-Seed `instagram_accounts.instagram_user_id` with `17841476354816630`. Set `instagram_accounts.system_prompt` to control the assistant instructions for that Instagram account. The webhook will create or update the `ig_contacts` row for `25391124670525123`, then create the DM session and messages.
-
-For RAG, insert embeddings into `knowledge_chunks` with the internal `instagram_accounts.id` value in `knowledge_chunks.instagram_account_id`. The app embeds the latest inbound DM or comment-trigger query, calls `match_knowledge_chunks(...)`, and adds the retrieved text as business knowledge when generating the reply.
-
-If `SUPABASE_URL` or `SUPABASE_SERVICE_ROLE_KEY` is missing, local development falls back to the old in-memory history behavior.
-
-## Instagram media backfill
-
-When onboarding a connected Instagram account, backfill historical media into `ig_posts` with the internal `instagram_accounts.id` value:
-
-```bash
-python3 backend/backfill_instagram_media.py YOUR_INTERNAL_INSTAGRAM_ACCOUNT_UUID --limit 1
-```
-
-Omit `--limit` to walk all available Instagram media pages. The script stores historical media as regular posts with `automation_enabled = false`.
-
-## Embedding ingestion
-
-The `embeddings/` folder contains a CLI for bulk-loading standardized JSONL data into `knowledge_chunks`.
-
-Create a `.env` file with:
-
-```env
-OPENAI_API_KEY=your-openai-key
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-INSTAGRAM_ACCOUNT_ID=your-internal-instagram-account-uuid
-INGEST_SOURCE_NAME=kosoo-chunks.jsonl
-INGEST_TRACK_RUNS=true
 ```
 
 Then run:
 
 ```bash
-python3 -m pip install -r embeddings/requirements.txt
-python3 embeddings/embed-to-db.py embeddings/businessData/kosoo-chunks.jsonl 32
+cd frontend-login
+npm ci
+npm run dev
 ```
 
-`INGEST_TRACK_RUNS=true` records the import in `ingest_runs`.
+Open `http://localhost:5173`.
 
-## Promotional comment automation
+### 5. Add business knowledge
 
-To enable comment-to-DM automation for a post, mark an `ig_posts` row as promotional and choose a `comment_trigger_mode`:
+Sign in and open the **Knowledge** page to add individual facts. For a large JSONL file, use the tool described in [the embedding guide](embeddings/README-embeddings.md).
 
-- `keywords` only triggers when the comment contains one of `trigger_keywords`.
-- `restaurant_intent` triggers when OpenAI classifies the comment as a positive/neutral genuine restaurant question or comment, such as dietary/menu questions, reservation/location/hours questions, purchase intent, or positive experience comments.
-- `keywords_or_restaurant_intent` checks keywords first, then uses restaurant-intent classification if no keyword matched.
+### 6. Connect webhooks
 
-Existing promotional posts default to `keywords`.
+Deploy the backend to a public HTTPS address. The included `render.yaml` can create the Flask service and follow-up cron job on Render.
 
-```sql
-update public.ig_posts
-set
-  post_type = 'promotional',
-  automation_enabled = true,
-  comment_trigger_mode = 'keywords',
-  automation_starts_at = now(),
-  automation_ends_at = now() + interval '7 days',
-  trigger_keywords = '["DM", "Test"]'::jsonb,
-  comment_reply_text = 'Check DMs',
-  dm_prompt = 'Send a friendly private reply about this promotion.',
-  promo_code_valid_duration_hours = 48,
-  promotion_metadata = '{"code_prefix": "KOSOO"}'::jsonb
-where instagram_media_id = 'YOUR_INSTAGRAM_MEDIA_ID';
-```
-
-For an intent-only promotional post, set `comment_trigger_mode = 'restaurant_intent'` and leave `trigger_keywords = '[]'::jsonb`. Classification results are stored in `ig_comment_classifications`; classifier failures fail closed and do not send a public reply, DM, or promo code. When a restaurant-intent comment qualifies, the backend retrieves relevant `knowledge_chunks`, generates a short public reply that mentions DMs, and generates a private DM that answers the comment before asking for name and phone. If OpenAI generation fails, the flow falls back to the configured `comment_reply_text` and the standard lead-capture DM.
-
-Automation is limited to one attempted DM per `post_id` and `contact_id`. The app only sends the public reply and private DM while the optional automation window is active:
-
-- `automation_starts_at = NULL` means the automation can start immediately.
-- `automation_ends_at = NULL` means the automation has no end date.
-- Both timestamps `NULL` means the promotional post behaves like an always-active automation as long as `automation_enabled = true`.
-- If `automation_starts_at` is in the future, comments are stored but no public reply, DM, or promo code is sent yet.
-- If `automation_ends_at` has passed, comments are stored but no public reply, DM, or promo code is sent.
-
-The app stores one readable promo code per customer/post in `ig_promo_codes`, but the initial Instagram DM does not reveal the code. Instead, the DM asks the customer to reply with their name and phone number so the code can be texted to them. The lead-capture state is stored in `ig_promo_leads`, and successful SMS sends are logged in `ig_sms_messages`. If `promotion_metadata.code_prefix` is not set, codes use the `PROMO` prefix.
-
-Inbound DMs are checked for an active collecting promo lead before the normal RAG chatbot path. The app extracts the customer name and phone number, normalizes US/Canada phone numbers to E.164, stores consent timing, and sends the promo code by Twilio SMS once both fields are available. If either field is missing or the phone number cannot be normalized, the Instagram reply asks only for the missing detail.
-
-If a promo customer replies by SMS, configure the Twilio Messaging Service incoming message webhook to:
+Configure these incoming webhook addresses:
 
 ```text
-POST https://YOUR_BACKEND_HOST/api/twilio/sms-webhook
+Meta callback:   https://YOUR_BACKEND/webhook
+Twilio SMS:      https://YOUR_BACKEND/api/twilio/sms-webhook
 ```
 
-The backend matches inbound SMS by sender phone number against existing `ig_promo_leads`, stores the conversation in `ig_sms_conversations` and `ig_sms_conversation_messages`, retrieves RAG knowledge for the matched Instagram account, generates a concise SMS reply with OpenAI, and sends the reply through Twilio. Unknown phone numbers are ignored for v1. SMS stop keywords such as `STOP`, `UNSUBSCRIBE`, and `CANCEL` close the app-level SMS conversation and do not trigger the LLM.
+Use the same Meta verification token in Meta and `META_VERIFY_TOKEN`. Give the deployed frontend URL to `FRONTEND_ORIGIN`, and give the cron service the same `FOLLOWUP_CRON_SECRET` as the backend.
 
-Promo code validity is controlled by `promo_code_valid_duration_hours` on the post:
+The frontend is not deployed by `render.yaml`; deploy `frontend-login/` separately to a static web host.
 
-- `promo_code_valid_duration_hours = NULL` means newly issued codes do not expire, so `ig_promo_codes.expires_at` stays `NULL`.
-- A positive value, such as `48`, means each newly issued code is valid for that many hours from the moment it is created.
-- Reused codes keep their original `valid_from` and `expires_at`; changing the post duration later does not rewrite already-issued codes.
-- Expiration is checked from `ig_promo_codes.expires_at`; when webhook traffic is processed, issued codes with `expires_at < now()` are marked `expired`.
-- `status = 'expired'` means the validity window has passed; `redeemed` means the code was used; `void` means an admin/manual flow invalidated it.
+## A simple test scenario
 
-When a staff user redeems a promo code through the `frontend-login` Redeem page, the backend creates one durable `ig_sms_messages` row for that promo code with `purpose = 'post_redemption_followup'`. By default, the follow-up SMS is scheduled for 10 minutes after `ig_promo_codes.redeemed_at` and is sent to the phone number collected for the promo lead. The message body is generated with OpenAI using the customer name and any staff redemption notes; if generation fails, the backend falls back to the existing generic/template follow-up body.
+1. Add a few facts about a fictional business on the Knowledge page.
+2. Create a keyword promotion from the Add Promotion page.
+3. Publish a new Instagram post while the setup is polling.
+4. Comment with the chosen keyword from another account.
+5. Reply to the private message with a name and phone number.
+6. Confirm that the promo code arrives by SMS.
+7. Redeem the code in the dashboard and add a staff note.
+8. Run the follow-up processor and confirm that the customer receives a follow-up SMS.
 
-Follow-ups are not sent by an in-memory timer. Run the due-message processor from a cron service such as Render Cron or Supabase cron:
+## Security
 
-```bash
-curl -X POST https://YOUR_BACKEND_HOST/api/followups/process-due \
-  -H "X-Followup-Cron-Secret: YOUR_FOLLOWUP_CRON_SECRET"
-```
-
-The processor finds pending SMS rows with `scheduled_for <= now()`, sends them through Twilio, then marks each row `sent` or `failed`.
-
-On Render, this repo defines a separate cron service named `process-promo-followups` in `render.yaml`. It runs every minute and calls the backend processor endpoint through `backend/process_due_followups.py`. Set these env vars on the cron service:
-
-```env
-BACKEND_URL=https://your-render-service.onrender.com
-FOLLOWUP_CRON_SECRET=the-same-secret-used-by-your-backend
-```
-
-The cron service is separate from the web service, so it does not automatically know the backend URL unless `BACKEND_URL` is set.
-
-The `frontend-login` Add Promotion page creates a pending `ig_promotion_setups` row through `POST /api/promotions`. The form includes the promotion trigger mode, trigger keywords when needed, automation window, promo-code validity duration, comment reply text, DM prompt, and code prefix. The backend snapshots the selected account's existing `ig_posts.instagram_media_id` values, polls Instagram media every 30 seconds for up to 5 minutes, and turns the newest unseen media item into a promotional `ig_posts` row. Only one pending/polling setup can exist per Instagram account.
-
-## Run locally
-
-```bash
-pip install -r backend/requirements.txt
-python backend/app.py
-```
-
-Then send a test request:
-
-```bash
-curl -X POST http://localhost:5000/webhook \
-  -H "Content-Type: application/json" \
-  -d '{
-    "object": "instagram",
-    "entry": [
-      {
-        "time": 1777318396685,
-        "id": "17841476354816630",
-        "messaging": [
-          {
-            "sender": {
-              "id": "25391124670525123"
-            },
-            "recipient": {
-              "id": "17841476354816630"
-            },
-            "timestamp": 1777318396235,
-            "message": {
-              "mid": "local-test-message-1",
-              "text": "Qwerty"
-            }
-          }
-        ]
-      }
-    ]
-  }'
-```
-
-Test Meta verification locally:
-
-```bash
-curl "http://localhost:5000/webhook?hub.mode=subscribe&hub.verify_token=your-token&hub.challenge=12345"
-```
-
-## Deploy on Render
-
-1. Push this folder to GitHub.
-2. In Render, create a new Web Service from that repo.
-3. Render should detect `render.yaml` automatically.
-4. After deploy, your webhook URL will be:
-
-```text
-https://your-render-service.onrender.com/webhook
-```
-
-In the Meta developer dashboard:
-
-1. Set the callback URL to your Render `/webhook` URL.
-2. Set the verify token to the same value as `META_VERIFY_TOKEN`.
-3. Complete webhook verification.
-
-## View console output
-
-Open your service in Render and check the **Logs** tab to see:
-
-- verification attempts
-- detected event type (`comment-related`, `dm-related`, or `unknown`)
-- processing results such as `replied`, `fallback_sent`, `duplicate_dm_ignored`, `instagram_account_not_configured`, `skipped_echo`, or `skipped_read_receipt`
-- comment automation results such as `comment_automation_sent`, `comment_no_keyword_match`, `comment_no_restaurant_intent_match`, `comment_classifier_failed`, `comment_duplicate_automation`, `comment_public_reply_failed`, or `comment_private_reply_failed`
-- full webhook payloads
-- the Supabase IDs for the business, Instagram account, contact, session, and messages
-- the OpenAI generation result, including how many RAG knowledge chunks were included
-- the send-message API response when a reply is attempted
+- Keep `.env` files private.
+- Never expose `SUPABASE_SERVICE_ROLE_KEY`, OpenAI keys, Meta tokens, or Twilio credentials in browser code.
+- Keep Twilio signature validation enabled in production.
+- Use test accounts and test phone numbers when recording a public demo.
+- Rotate old credentials before publishing or redeploying the project.

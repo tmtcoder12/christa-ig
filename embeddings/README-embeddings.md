@@ -1,15 +1,64 @@
-# Embedding Ingestion
+# Embedding ingestion technical guide
 
-Embed JSONL content with OpenAI and upsert the vectors into Supabase `knowledge_chunks`.
+This folder contains a command-line tool for loading business knowledge into Supabase in bulk.
+
+The main app can add one knowledge chunk at a time through the dashboard. This tool is intended for larger prepared datasets such as product catalogs, service lists, menus, policies, FAQs, and website content.
 
 ## Files
 
-- `embed-to-db.py`: CLI for batch JSONL ingestion.
-- `ingest_jsonl_items.py`: reusable list/single item ingestion helpers.
-- `supabase_store.py`: small PostgREST adapter for `knowledge_chunks` and `ingest_runs`.
-- `businessData/kosoo-chunks.jsonl`: example standardized JSONL dataset.
+- `embed-to-db.py`: command-line entry point and JSONL loader
+- `ingest_jsonl_items.py`: validation, batching, metadata mapping, and OpenAI embedding logic
+- `supabase_store.py`: PostgREST writes to `knowledge_chunks` and `ingest_runs`
+- `requirements.txt`: Python dependencies for this tool
 
-## Environment Variables
+## Data flow
+
+```text
+JSONL file
+   ↓
+Validate item IDs and text
+   ↓
+Send text batches to OpenAI Embeddings
+   ↓
+Build 1,536-value vector rows and metadata
+   ↓
+Upsert into Supabase knowledge_chunks by ID
+   ↓
+Record success or error in ingest_runs
+```
+
+Each run belongs to one internal `instagram_accounts.id`. This separates the knowledge used by different accounts and businesses.
+
+## Requirements
+
+- Python 3.10 or newer
+- The database schema from `backend/database/schema.sql`
+- A valid row in `instagram_accounts`
+- An OpenAI API key
+- A Supabase service-role key
+
+Install the dependencies from the repository root:
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install -r embeddings/requirements.txt
+```
+
+If the same virtual environment will also run the backend, install both requirement files.
+
+## Environment variables
+
+Create a root `.env` or export these values in the shell:
+
+```env
+OPENAI_API_KEY=your-openai-key
+SUPABASE_URL=https://your-project.supabase.co
+SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
+INSTAGRAM_ACCOUNT_ID=your-internal-instagram-account-uuid
+INGEST_SOURCE_NAME=business-knowledge.jsonl
+INGEST_TRACK_RUNS=true
+```
 
 Required:
 
@@ -18,54 +67,90 @@ Required:
 - `SUPABASE_SERVICE_ROLE_KEY`
 - `INSTAGRAM_ACCOUNT_ID`
 
-`INSTAGRAM_ACCOUNT_ID` is the internal UUID from `public.instagram_accounts.id`, not the Meta Instagram user ID.
+`INSTAGRAM_ACCOUNT_ID` is the UUID from `public.instagram_accounts.id`. It is not the public Instagram user ID or username.
 
 Optional:
 
-- `INGEST_SOURCE_NAME` defaults to `chunks.jsonl`
-- `INGEST_TRACK_RUNS` defaults to `true`
+- `INGEST_SOURCE_NAME`: label stored with the run; defaults to `chunks.jsonl`
+- `INGEST_TRACK_RUNS`: records progress in `ingest_runs`; defaults to `true`
 
-## JSONL Format
+Keep the service-role key private. It bypasses Supabase row-level security.
 
-Each line must be a JSON object with:
+## JSONL input format
 
-- `id`: UUID string
-- `text`: string to embed
+JSONL contains one JSON object per line. Blank lines are ignored.
 
-Optional:
+Every object requires:
 
-- `metadata.type`
-- `metadata.source_url`
-- `metadata.page_path`
-- `metadata.title`
-- `metadata.meta_description`
-- `metadata.Image_url`, `metadata.image_url`, or `metadata.imageUrl`
-- any other metadata keys, stored in `knowledge_chunks.extra_metadata`
+- `id`: a UUID string
+- `text`: the text that will be embedded and later supplied to the AI
+
+The optional `metadata` object can contain:
+
+- `type`
+- `source_url`
+- `page_path`
+- `title`
+- `meta_description`
+- `Image_url`, `image_url`, or `imageUrl`
+- Any additional custom fields
 
 Example:
 
 ```json
-{"id":"376110e9-de5a-4707-b8ee-e8a5403eacab","text":"type: All You Can Eat Menu\ncategory: Lunch Menu\nitem_name: Combo A","metadata":{"type":"All You Can Eat Menu","category":"Lunch Menu","item_name":"Combo A","price":26.99}}
+{"id":"376110e9-de5a-4707-b8ee-e8a5403eacab","text":"Premium members can book classes seven days in advance.","metadata":{"type":"membership_policy","category":"booking","title":"Advance booking","source_url":"https://example.com/memberships"}}
+{"id":"6d213c1e-cf1a-4388-ad7d-12c849337969","text":"The blue jacket is available in sizes XS through XL.","metadata":{"type":"product","category":"outerwear","title":"Blue jacket"}}
 ```
 
-## CLI Usage
+Standard metadata fields receive their own database columns. Other fields are stored in `extra_metadata`. Image URL spellings are normalized into `extra_metadata.Image_url`.
 
-Install dependencies:
+The tool also stores a SHA-256 hash of the text in `content_hash`.
+
+## Run the importer
+
+From the repository root:
 
 ```bash
-python3 -m pip install -r embeddings/requirements.txt
+python embeddings/embed-to-db.py path/to/business-knowledge.jsonl
 ```
 
-Run ingestion:
+Pass a second argument to change the batch size:
 
 ```bash
-python3 embeddings/embed-to-db.py embeddings/businessData/kosoo-chunks.jsonl
-python3 embeddings/embed-to-db.py embeddings/businessData/kosoo-chunks.jsonl 32
+python embeddings/embed-to-db.py path/to/business-knowledge.jsonl 32
 ```
 
-The optional second argument is `batch_size`, defaulting to `128`.
+The default batch size is `128`. Each batch is sent to the OpenAI Embeddings API in one request.
 
-## API Usage
+`embed-to-db.py` calls `load_dotenv()` and searches for a nearby `.env` file. A root `.env` is found when the command is run from this repository.
+
+## Embedding model and database dimensions
+
+The importer currently uses a fixed model:
+
+```text
+text-embedding-3-small
+```
+
+It verifies that every returned embedding contains exactly 1,536 numbers. This matches the `vector(1536)` column in `backend/database/schema.sql`.
+
+Changing the model to one with a different vector size also requires a database migration and an update to `EMBED_DIM`.
+
+## Upsert and retry behavior
+
+Rows are upserted on the chunk `id`:
+
+- A new ID inserts a chunk.
+- An existing ID updates that chunk.
+- Reusing stable IDs makes an import repeatable.
+
+The importer can finish some batches before a later batch fails. Those earlier rows remain in Supabase. It is safe to correct the input and run it again because rows use deterministic IDs.
+
+When run tracking is enabled, the tool creates an `ingest_runs` row with `running` status and later changes it to `success` or `error`. Run tracking describes the overall attempt; the database may still contain rows from completed batches after an error.
+
+## Using the ingestion functions from Python
+
+`ingest_jsonl_items` can also be called directly:
 
 ```python
 from ingest_jsonl_items import ingest_jsonl_items
@@ -74,8 +159,11 @@ results = ingest_jsonl_items(
     items=[
         {
             "id": "376110e9-de5a-4707-b8ee-e8a5403eacab",
-            "text": "Chunk text",
-            "metadata": {"type": "menu_item", "title": "Combo A"},
+            "text": "Premium members can book classes seven days in advance.",
+            "metadata": {
+                "type": "membership_policy",
+                "category": "booking",
+            },
         }
     ],
     instagram_account_id="internal-instagram-account-uuid",
@@ -83,10 +171,27 @@ results = ingest_jsonl_items(
 )
 ```
 
-Return value:
+The return value contains the chunk ID, account ID, and content hash for each processed item.
 
-```python
-[
-  {"id": "...", "instagram_account_id": "...", "content_hash": "..."}
-]
-```
+Optional `client` and `store` arguments allow callers or tests to supply their own OpenAI client and `SupabaseStore`.
+
+## How the main app uses these rows
+
+When a DM, qualifying comment, or SMS reply arrives, the backend:
+
+1. Embeds the customer's text.
+2. Calls the `match_knowledge_chunks` database function.
+3. Filters by the current Instagram account.
+4. Selects the closest chunks using cosine similarity.
+5. Adds their text and source information to the OpenAI prompt.
+
+Good chunks should be short, specific, understandable without surrounding text, and limited to one fact or closely related group of facts.
+
+## Common errors
+
+- `INSTAGRAM_ACCOUNT_ID must be a valid UUID`: use `instagram_accounts.id`, not the Meta ID.
+- Foreign-key failure: create the Instagram account row before importing.
+- Unexpected embedding dimension: the OpenAI model no longer matches the database vector size.
+- Supabase `401` or `403`: check the URL and service-role key.
+- Duplicate or overwritten content: make sure unrelated chunks do not reuse the same UUID.
+- Poor retrieval: split broad documents into smaller, focused chunks and put the useful wording in `text`.
