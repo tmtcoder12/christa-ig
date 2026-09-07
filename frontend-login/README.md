@@ -1,132 +1,56 @@
 # Frontend technical guide
 
-The frontend is a React and TypeScript staff dashboard built with Vite. It handles authentication, business/account selection, promotion setup, promo-code redemption, and knowledge management.
+This folder contains the React and TypeScript staff dashboard. It preserves the existing sign-in, account selection, promotion, knowledge, and redemption screens.
 
 ## Technology
 
-- React 19
-- TypeScript
+- React 19 and React Router
+- TypeScript with strict checking
 - Vite
-- React Router
 - Supabase JavaScript client
-- Plain CSS in `src/styles.css`
+- Vitest, Testing Library, and MSW
+- ESLint and Prettier
 
 ## Source structure
 
 ```text
 src/
 ├── components/
-│   ├── AppShell.tsx          Shared header, selectors, and navigation
-│   └── ProtectedRoute.tsx    Authentication guard
+│   ├── AppShell.tsx
+│   ├── ErrorBoundary.tsx
+│   └── ProtectedRoute.tsx
 ├── lib/
-│   ├── accountContext.tsx    Business and Instagram account state
-│   ├── auth.tsx              Supabase session and auth actions
-│   ├── authEvents.ts         Login/logout audit records
-│   ├── backend.ts            Typed backend API calls
-│   └── supabase.ts           Browser-safe Supabase client
+│   ├── accountContext.tsx
+│   ├── auth.tsx
+│   ├── authEvents.ts
+│   ├── backend.ts
+│   ├── database.types.ts
+│   ├── env.ts
+│   └── supabase.ts
 ├── pages/
-│   ├── SignIn.tsx
-│   ├── SignUp.tsx
 │   ├── AddPromotion.tsx
+│   ├── Knowledge.tsx
 │   ├── Redeem.tsx
-│   └── Knowledge.tsx
-├── App.tsx                   Route definitions
-├── main.tsx                  React entry point
-├── styles.css                Application styling
-└── types.ts                  Shared API and database types
+│   ├── SignIn.tsx
+│   └── SignUp.tsx
+├── test/
+├── App.tsx
+├── main.tsx
+├── styles.css
+└── types.ts
 ```
 
-## Routes
+`ErrorBoundary` is mounted above the router. Unexpected render errors show a stable recovery screen instead of a blank page.
 
-| Route | Access | Purpose |
-| --- | --- | --- |
-| `/signin` | Public | Sign in with email and password |
-| `/signup` | Public | Create a Supabase Auth account |
-| `/redeem` | Protected | Redeem a promotion code and record staff notes |
-| `/add-promotion` | Protected | Configure and watch a new promotion setup |
-| `/knowledge` | Protected | Add, browse, and filter knowledge chunks |
+## Configuration
 
-Unknown routes redirect to `/redeem`. Protected routes redirect signed-out users to `/signin`.
+Copy the tracked placeholder file:
 
-## Authentication
-
-`AuthProvider` initializes the current Supabase session and listens for auth changes. Sign-in and sign-up use Supabase email/password authentication.
-
-After authentication, the frontend upserts the user's `profiles` row. Login and logout actions are also written to `user_auth_events` when possible.
-
-Signing up does not create a business. A new user must still be connected to:
-
-1. A `businesses` row
-2. A `business_users` row
-3. At least one `instagram_accounts` row
-
-Without these records, the shell displays an empty-state message.
-
-## Account context
-
-`AccountProvider` loads accessible businesses directly from Supabase. After a business is selected, it loads that business's Instagram accounts.
-
-It exposes the selected business and Instagram account to all protected pages. The first available record is selected automatically. Supabase row-level security decides which records the signed-in user can read.
-
-## Data access boundaries
-
-The frontend talks to two services:
-
-### Direct Supabase access
-
-The browser uses the public anon key for:
-
-- Authentication
-- Profile creation/update
-- Login/logout audit events
-- Reading accessible businesses
-- Reading accessible Instagram accounts
-
-These operations rely on the policies in `backend/database/schema.sql`.
-
-### Flask backend access
-
-Promotion, redemption, and knowledge operations go through the Flask backend. `src/lib/backend.ts` adds the Supabase access token to each request:
-
-```text
-Authorization: Bearer <supabase-access-token>
+```bash
+cp .env.example .env.local
 ```
 
-The backend verifies the token and checks business membership before accessing account data with the service-role key.
-
-## Page behavior
-
-### Add Promotion
-
-The page collects:
-
-- Comment trigger mode
-- Trigger keywords
-- Optional automation start and end times
-- Optional promo-code lifetime
-- Public reply text
-- Optional private-DM instructions
-- Optional promo-code prefix
-
-It posts the form to `/api/promotions`. The backend then watches for a newly published Instagram post. While the setup is `pending` or `polling`, the frontend requests `/api/promotions/<id>` every five seconds and displays the current status.
-
-The UI allows one of three trigger modes: keywords, restaurant intent, or both. Keywords are required unless restaurant intent is the only mode.
-
-### Redeem
-
-The page normalizes entered codes to uppercase and posts them with the selected Instagram account and optional staff notes.
-
-It displays whether the code was redeemed, expired, already redeemed, void, or not found. A successful response can also show the scheduled follow-up time and customer-profile redemption count.
-
-### Knowledge
-
-The page lists ten chunks at a time for the selected Instagram account. Staff can filter by type and category and can add one new chunk with optional metadata.
-
-New text is sent to the backend, which creates the OpenAI embedding before storing it. The service-role key never reaches the browser.
-
-## Environment configuration
-
-Create `.env.local`:
+Set:
 
 ```env
 VITE_SUPABASE_URL=https://your-project.supabase.co
@@ -134,51 +58,100 @@ VITE_SUPABASE_ANON_KEY=your-public-anon-key
 VITE_BACKEND_URL=http://127.0.0.1:5000
 ```
 
-Only browser-safe values may use the `VITE_` prefix. Never place the Supabase service-role key, OpenAI key, Meta token, or Twilio credentials here.
+`env.ts` trims URLs, accepts only HTTP(S), and reports missing Supabase values. Protected pages show the configuration errors rather than attempting to run with partial settings.
 
-If the two Supabase values are missing, `ProtectedRoute` displays a configuration message instead of rendering the app.
+Only browser-safe values may use the `VITE_` prefix. Never put a service-role key, OpenAI key, Meta secret, or Twilio credential in this folder.
 
-## Run locally
+## Authentication and account selection
+
+`AuthProvider` loads the current Supabase session and listens for authentication changes. Protected routes wait for session initialization and redirect signed-out users to `/signin`.
+
+After sign-in, `AccountProvider` reads the user's visible businesses. Selecting a business loads its Instagram accounts. The browser's anon key is constrained by Supabase row-level security; the frontend does not decide tenant access itself.
+
+A new sign-up creates the Auth user and profile only. Business membership and Instagram account onboarding still happen outside this UI.
+
+## Data access
+
+The browser talks directly to Supabase for authentication, profile/audit records, businesses, and Instagram account selection. `database.types.ts` supplies generated-shape database types to `createClient<Database>` so direct queries are checked by TypeScript.
+
+Regenerate this file after a database change with a linked project:
 
 ```bash
-cd frontend-login
+supabase gen types typescript --linked > src/lib/database.types.ts
+```
+
+For local Supabase, use:
+
+```bash
+supabase gen types typescript --local > src/lib/database.types.ts
+```
+
+Review generated changes before committing them.
+
+Promotion, redemption, and knowledge operations go through Flask. `backend.ts` adds the Supabase bearer token, applies a 10-second timeout, and turns server errors into typed `ApiError` objects containing status, code, and request ID.
+
+Safe GET requests retry transient 408, 429, 502, 503, and 504 responses twice. POST mutations never retry automatically, preventing duplicate promotions, knowledge rows, or redemptions when delivery is uncertain.
+
+## Pages
+
+- `/signin` and `/signup`: public Supabase email/password authentication
+- `/redeem`: submit a code and show redeemed, expired, already-redeemed, void, or not-found results
+- `/add-promotion`: create a setup and poll its status every five seconds while active
+- `/knowledge`: add, filter, and page through account knowledge ten rows at a time
+
+Unknown routes redirect to `/redeem`.
+
+## Local development
+
+Use Node.js 22.13 or newer:
+
+```bash
 npm ci
 npm run dev
 ```
 
-The development server runs at `http://localhost:5173` by default. The backend allows this origin automatically.
+Vite serves the app at `http://localhost:5173` by default.
 
-## Build
+## Automated testing and checks
 
 ```bash
+npm run format:check
+npm run lint
+npm run typecheck
+npm test
 npm run build
 ```
 
-The script runs TypeScript project compilation and then produces the static site in `dist/`.
+Or run everything:
 
-To inspect the production build locally:
+```bash
+npm run check
+```
+
+The tests mock both Flask and Supabase boundaries. They cover configuration, typed API errors, safe GET retries, mutation retry protection, authentication guards, account selection, promotion polling, knowledge pagination, and redemption results.
+
+Use `npm run format` to apply Prettier.
+
+## Production build and deployment
+
+```bash
+npm ci
+npm run build
+```
+
+The output is `dist/`. Render builds this folder as a static site, rewrites unknown paths to `index.html` for React Router, and adds basic response security headers. Set all three `VITE_` values in Render before the build.
+
+`VITE_BACKEND_URL` must be the public Gunicorn service URL. Add the exact frontend origin to the backend's `FRONTEND_ORIGINS` value.
+
+To inspect a production build locally:
 
 ```bash
 npm run preview
 ```
 
-## Deployment
+## Current limits
 
-Deploy `frontend-login/` to a static host with:
-
-- Build command: `npm ci && npm run build`
-- Output directory: `dist`
-- `VITE_BACKEND_URL` set to the public Flask URL
-- Supabase URL and anon key set at build time
-
-Configure the static host to send unknown paths to `index.html`; otherwise refreshing `/redeem` or another client-side route may return 404.
-
-Set the frontend's exact public origin as `FRONTEND_ORIGIN` on the backend. Do not include a trailing slash.
-
-## Current limitations
-
-- Business and Instagram-account onboarding must be completed outside the UI.
 - Account selection is not saved across browser sessions.
-- There is no public demo mode or sample-data mode.
-- There are no automated component or end-to-end tests.
-- The frontend does not currently show DM, comment, lead, or SMS history.
+- Business onboarding is not part of the dashboard.
+- The dashboard does not show full DM, comment, lead, or SMS history.
+- There is no public demo-data mode.

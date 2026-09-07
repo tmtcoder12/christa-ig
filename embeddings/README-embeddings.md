@@ -31,8 +31,8 @@ Each run belongs to one internal `instagram_accounts.id`. This separates the kno
 
 ## Requirements
 
-- Python 3.10 or newer
-- The database schema from `backend/database/schema.sql`
+- Python 3.12
+- The migrated Supabase schema, or the fresh-install snapshot at `backend/database/schema.sql`
 - A valid row in `instagram_accounts`
 - An OpenAI API key
 - A Supabase service-role key
@@ -40,7 +40,7 @@ Each run belongs to one internal `instagram_accounts.id`. This separates the kno
 Install the dependencies from the repository root:
 
 ```bash
-python3 -m venv .venv
+python3.12 -m venv .venv
 source .venv/bin/activate
 python -m pip install -r embeddings/requirements.txt
 ```
@@ -49,7 +49,13 @@ If the same virtual environment will also run the backend, install both requirem
 
 ## Environment variables
 
-Create a root `.env` or export these values in the shell:
+Copy the tracked placeholder file, then fill in its values:
+
+```bash
+cp .env.example .env
+```
+
+The file contains:
 
 ```env
 OPENAI_API_KEY=your-openai-key
@@ -122,7 +128,13 @@ python embeddings/embed-to-db.py path/to/business-knowledge.jsonl 32
 
 The default batch size is `128`. Each batch is sent to the OpenAI Embeddings API in one request.
 
-`embed-to-db.py` calls `load_dotenv()` and searches for a nearby `.env` file. A root `.env` is found when the command is run from this repository.
+`embed-to-db.py` calls `load_dotenv()` and searches for a nearby `.env` file. Run the command from the repository root so it loads the root file consistently.
+
+Database changes are versioned under `supabase/migrations/`. For a local database, replay them before importing:
+
+```bash
+supabase db reset
+```
 
 ## Embedding model and database dimensions
 

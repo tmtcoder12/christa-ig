@@ -1,181 +1,143 @@
 # Christa IG
 
-Christa IG helps a business turn Instagram conversations into useful customer interactions.
+Christa IG helps a business turn Instagram comments and messages into useful customer conversations.
 
-It can answer direct messages using the business's own information, react to comments on promotional posts, collect customer details, send promo codes by text message, and help staff redeem those codes.
+It can answer questions from the business's own knowledge, run comment-based promotions, collect customer details, send promo codes by SMS, and give staff a simple place to manage knowledge and redeem codes.
 
-The project was first built for restaurants, but most of it can also support businesses such as:
+The first use case was a restaurant, but the same system can support:
 
-- Gyms answering membership questions and promoting trial passes
+- Gyms answering membership questions and offering trial passes
 - Online shops answering product questions and sending discount codes
 - Salons collecting leads for seasonal offers
-- Local services answering common questions and following up with customers
-- Events and venues promoting tickets or special packages
+- Local services answering FAQs and following up with customers
+- Events promoting tickets or packages
 
-The current AI comment classifier is written for restaurant conversations. Other businesses can use keyword-based promotions immediately. The classifier prompt can also be changed for another industry.
+Keyword promotions work for any business. The optional AI comment classifier is still written for restaurant intent.
 
-## What it can do
+## What is included
 
-- Reply to Instagram direct messages with AI
-- Use business-specific facts, policies, products, menus, or FAQs when writing replies
-- Start a promotion when a comment contains a chosen keyword
-- Recognize restaurant-related questions and buying interest with AI
-- Reply publicly and send a private Instagram message
-- Collect a customer's name and phone number through direct messages
-- Create one unique promo code for each customer and promotion
-- Send promo codes and follow-up messages through Twilio SMS
-- Let staff create promotions, manage knowledge, and redeem codes in a web dashboard
-- Keep each business's data separate with Supabase authentication and access rules
+- `frontend-login/`: React staff dashboard
+- `backend/`: Flask API, webhook receiver, and background worker
+- `embeddings/`: bulk knowledge importer
+- `supabase/`: versioned database migrations and local Supabase settings
+- `render.yaml`: web, worker, and static-site deployment blueprint
 
-## How it works
+Instagram webhook events are verified and saved to a durable Supabase queue. A separate worker processes them, calls OpenAI when needed, and sends replies through Instagram or Twilio. This keeps slow or unreliable outside services out of the webhook request.
 
-The project has three parts:
+## Requirements
 
-- `frontend-login/`: the React staff dashboard
-- `backend/`: the Flask API and webhook service
-- `embeddings/`: a tool for loading larger amounts of business knowledge
-
-Instagram and Twilio send new events to the backend. The backend stores them in Supabase, asks OpenAI for help when needed, and sends the response back through Instagram or SMS.
-
-For more detail, see:
-
-- [Backend guide](backend/README.md)
-- [Frontend guide](frontend-login/README.md)
-- [Embedding guide](embeddings/README-embeddings.md)
-
-## What you need
-
-- Python 3.10 or newer
-- Node.js 20.19+ or 22.12+
+- Python 3.12
+- Node.js 22.13 or newer
+- Docker Desktop and the Supabase CLI for a local database
 - A Supabase project
 - An OpenAI API key
-- A Meta app and a connected professional Instagram account
-- A Twilio account if you want SMS features
-- A public HTTPS address for receiving webhooks in production
+- A Meta app and connected professional Instagram account
+- A Twilio account for SMS features
 
-## Setup
+## Local setup
 
-### 1. Create the database
+### 1. Install dependencies
 
-Create a Supabase project. Open its SQL editor and run:
+```bash
+make setup
+```
+
+### 2. Create the database
+
+For a new local Supabase database:
+
+```bash
+supabase start
+supabase db reset
+```
+
+For an existing hosted project, review the files in `supabase/migrations/` and apply them with the normal Supabase CLI migration workflow. Do not rerun the baseline over an existing database.
+
+`backend/database/schema.sql` is the complete fresh-install snapshot.
+
+### 3. Add the first business
+
+Create a Supabase Auth user, then add:
+
+1. A matching `profiles` row
+2. A `businesses` row
+3. A `business_users` row linking the user to the business as `owner`
+4. An `instagram_accounts` row for the business
+
+The account's `instagram_user_id` must be the ID Meta sends as `entry.id`, not its username.
+
+### 4. Configure local environment files
+
+```bash
+cp backend/.env.example backend/.env
+cp frontend-login/.env.example frontend-login/.env.local
+cp .env.example .env
+```
+
+Fill in the backend and frontend values. Keep the Supabase service-role key, Meta app secret, OpenAI key, and Twilio credentials out of the frontend file.
+
+### 5. Run all three processes
+
+In separate terminals from the repository root:
+
+```bash
+.venv/bin/python backend/app.py
+```
+
+```bash
+cd backend && ../.venv/bin/python -m christa_ig.worker
+```
+
+```bash
+cd frontend-login && npm run dev
+```
+
+Open `http://localhost:5173`. The API is at `http://127.0.0.1:5000`.
+
+## Webhook setup
+
+Use a public HTTPS backend URL for real integrations:
 
 ```text
-backend/database/schema.sql
+Meta callback: https://YOUR_BACKEND/webhook
+Twilio SMS:    https://YOUR_BACKEND/api/twilio/sms-webhook
 ```
 
-This creates the tables, access rules, and vector search function used by the app.
+Set the same Meta verification token in Meta and `META_VERIFY_TOKEN`. Set `META_APP_SECRET` to the Meta app secret so webhook signatures can be checked.
 
-### 2. Create your first account records
+## Checks and tests
 
-Create a user in Supabase Authentication and note its user ID. Then use the Supabase SQL editor to create:
-
-1. A matching row in `profiles`
-2. A row in `businesses`
-3. A row in `business_users` that links your Supabase user ID to that business with the `owner` role
-4. A row in `instagram_accounts` that links the business to its Instagram account
-
-You can also create the user with the frontend sign-up page after completing its setup below; that path creates the `profiles` row for you. The dashboard does not create the remaining business records yet. The `instagram_user_id` must be the ID Meta sends as `entry.id`, not the username.
-
-### 3. Configure the backend
-
-Create `backend/.env`:
-
-```env
-META_VERIFY_TOKEN=choose-a-private-verification-token
-INSTAGRAM_ACCESS_TOKEN=your-instagram-access-token
-
-SUPABASE_URL=https://your-project.supabase.co
-SUPABASE_SERVICE_ROLE_KEY=your-service-role-key
-SUPABASE_ANON_KEY=your-anon-key
-
-OPENAI_API_KEY=your-openai-api-key
-
-TWILIO_ACCOUNT_SID=your-twilio-account-sid
-TWILIO_AUTH_TOKEN=your-twilio-auth-token
-TWILIO_MESSAGING_SERVICE_SID=your-messaging-service-sid
-
-FOLLOWUP_CRON_SECRET=choose-another-private-token
-FRONTEND_ORIGIN=http://localhost:5173
-```
-
-Twilio values are only required for SMS features. Never put the service-role key or other private keys in the frontend.
-
-Create and run the backend:
+Run every local quality check with:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r backend/requirements.txt
-
-set -a
-source backend/.env
-set +a
-
-python backend/app.py
+make check
 ```
 
-Check that it is running:
+This runs Ruff, backend tests and coverage, Prettier, ESLint, TypeScript, frontend component tests, and a production frontend build. Database migrations and row-level-security tests run in CI and can be run locally with:
 
 ```bash
-curl http://127.0.0.1:5000/
+supabase db reset
+supabase test db
 ```
 
-You should receive `{"status":"ok"}`.
+## Production deployment
 
-### 4. Configure the frontend
+`render.yaml` defines:
 
-Create `frontend-login/.env.local` and fill in:
+- A Gunicorn web service with health checks
+- A continuously running background worker
+- A static React site with SPA routing and security headers
 
-```env
-VITE_SUPABASE_URL=https://your-project.supabase.co
-VITE_SUPABASE_ANON_KEY=your-anon-key
-VITE_BACKEND_URL=http://127.0.0.1:5000
-```
+Create a Render Blueprint from the repository and enter every value marked `sync: false`. Run the Supabase migrations before sending production traffic. The worker is a paid service.
 
-Then run:
+Health endpoints:
 
-```bash
-cd frontend-login
-npm ci
-npm run dev
-```
+- `/health/live`: process is running
+- `/health/ready`: required integrations are configured
+- `/`: compatibility health check
 
-Open `http://localhost:5173`.
+See the [backend guide](backend/README.md), [frontend guide](frontend-login/README.md), and [embedding guide](embeddings/README-embeddings.md) for technical details.
 
-### 5. Add business knowledge
+## Safe demo use
 
-Sign in and open the **Knowledge** page to add individual facts. For a large JSONL file, use the tool described in [the embedding guide](embeddings/README-embeddings.md).
-
-### 6. Connect webhooks
-
-Deploy the backend to a public HTTPS address. The included `render.yaml` can create the Flask service and follow-up cron job on Render.
-
-Configure these incoming webhook addresses:
-
-```text
-Meta callback:   https://YOUR_BACKEND/webhook
-Twilio SMS:      https://YOUR_BACKEND/api/twilio/sms-webhook
-```
-
-Use the same Meta verification token in Meta and `META_VERIFY_TOKEN`. Give the deployed frontend URL to `FRONTEND_ORIGIN`, and give the cron service the same `FOLLOWUP_CRON_SECRET` as the backend.
-
-The frontend is not deployed by `render.yaml`; deploy `frontend-login/` separately to a static web host.
-
-## A simple test scenario
-
-1. Add a few facts about a fictional business on the Knowledge page.
-2. Create a keyword promotion from the Add Promotion page.
-3. Publish a new Instagram post while the setup is polling.
-4. Comment with the chosen keyword from another account.
-5. Reply to the private message with a name and phone number.
-6. Confirm that the promo code arrives by SMS.
-7. Redeem the code in the dashboard and add a staff note.
-8. Run the follow-up processor and confirm that the customer receives a follow-up SMS.
-
-## Security
-
-- Keep `.env` files private.
-- Never expose `SUPABASE_SERVICE_ROLE_KEY`, OpenAI keys, Meta tokens, or Twilio credentials in browser code.
-- Keep Twilio signature validation enabled in production.
-- Use test accounts and test phone numbers when recording a public demo.
-- Rotate old credentials before publishing or redeploying the project.
+Use test accounts, fictional business knowledge, and test phone numbers in a public demo. Rotate any old credentials before publishing the repository. See [SECURITY.md](SECURITY.md) for reporting guidance.

@@ -1,350 +1,251 @@
 # Backend technical guide
 
-The backend is a Flask application that coordinates Instagram, OpenAI, Supabase, and Twilio. It receives webhooks, applies promotion and conversation rules, stores state, and sends outbound messages.
+The backend receives Instagram and Twilio webhooks, protects staff APIs, coordinates AI workflows, and stores durable state in Supabase.
 
-## Main files
+## Module boundaries
 
-- `app.py`: routes, event parsing, workflow logic, validation, and outbound API calls
-- `openai_client.py`: embeddings, chat replies, classification, lead extraction, and promotional copy
-- `supabase_client.py`: a small PostgREST data-access layer
-- `database/schema.sql`: tables, indexes, triggers, row-level security, and vector search
-- `backfill_instagram_media.py`: imports existing Instagram posts as non-promotional posts
-- `process_due_followups.py`: calls the protected follow-up endpoint from a cron service
+- `app.py`: compatible local and Gunicorn WSGI entrypoint
+- `christa_ig/factory.py`: Flask application factory and middleware
+- `christa_ig/routes.py`: route registration
+- `workflows.py`: DM, comment, promotion, redemption, and SMS workflows
+- `christa_ig/worker.py`: durable background processing loop
+- `christa_ig/webhook_events.py`: event expansion, deterministic IDs, and retry schedule
+- `christa_ig/config.py`: typed settings and production validation
+- `christa_ig/security.py`: Meta HMAC and constant-time secret checks
+- `christa_ig/observability.py`: request IDs and redacted JSON logs
+- `christa_ig/http_client.py`: timeouts and safe-request retry rules
+- `openai_client.py`: chat, embeddings, classification, extraction, and generated copy
+- `supabase_client.py`: PostgREST data-access functions
+- `database/schema.sql`: complete fresh-install database snapshot
+
+The application factory keeps imports testable while `backend/app.py` preserves the existing `app:app` WSGI interface.
 
 ## Runtime architecture
 
 ```text
-Meta webhooks ───────┐
-                     ├─> Flask ─> Supabase/Postgres + pgvector
-Staff dashboard ─────┤       ├─> OpenAI
-                     │       ├─> Instagram Graph API
-Twilio webhooks ─────┘       └─> Twilio SMS API
+Meta POST /webhook
+  -> verify raw-body HMAC
+  -> expand all events
+  -> idempotent webhook_jobs inserts
+  -> return plain OK
 
-Render cron ────────────────> protected follow-up endpoint
+Background worker
+  -> atomically claim queued events
+  -> run DM or comment workflow
+  -> Supabase + OpenAI + Instagram
+  -> clear successful raw payload
+  -> retry known transient failures
+
+Background worker
+  -> claim due promotion poll ticks -> Instagram media lookup
+  -> claim due SMS rows -> Twilio
+
+Staff React app -> bearer-protected Flask APIs -> Supabase
+Twilio webhook -> signature validation -> SMS conversation workflow
 ```
 
-The backend uses the Supabase REST API through Python's standard `urllib` module. It does not use the Supabase Python SDK. Backend database requests use the service-role key and therefore bypass row-level security; every staff-facing route must perform its own user and account-access checks.
+No OpenAI, Instagram, or Twilio call runs in Meta's webhook request path.
 
 ## Routes
 
-| Method | Path | Purpose | Authentication |
+| Method | Path | Purpose | Protection |
 | --- | --- | --- | --- |
-| `GET` | `/` | Health check | None |
-| `GET` | `/webhook` | Meta webhook verification | `META_VERIFY_TOKEN` query check |
-| `POST` | `/webhook` | Instagram DM and comment events | No request-signature check in the current code |
-| `POST` | `/api/twilio/sms-webhook` | Inbound customer SMS | Twilio signature |
-| `GET` | `/api/knowledge-chunks` | List and filter account knowledge | Supabase bearer token |
-| `POST` | `/api/knowledge-chunks` | Embed and create one knowledge chunk | Supabase bearer token |
-| `POST` | `/api/promotions` | Start promotion-post polling | Supabase bearer token |
-| `GET` | `/api/promotions/<id>` | Read promotion setup status | Supabase bearer token |
-| `POST` | `/api/promo-codes/redeem` | Redeem a code and schedule follow-up | Supabase bearer token |
-| `POST` | `/api/followups/process-due` | Send due follow-up SMS messages | `X-Followup-Cron-Secret` header |
+| `GET` | `/` | Compatibility health response | Public |
+| `GET` | `/health/live` | Process liveness | Public |
+| `GET` | `/health/ready` | Required configuration status | Public |
+| `GET` | `/webhook` | Meta subscription challenge | Verify token |
+| `POST` | `/webhook` | Durable Meta event intake | Meta HMAC |
+| `POST` | `/api/twilio/sms-webhook` | Inbound SMS | Twilio signature |
+| `GET` | `/api/knowledge-chunks` | Paginated account knowledge | Supabase bearer token |
+| `POST` | `/api/knowledge-chunks` | Embed and add knowledge | Supabase bearer token |
+| `POST` | `/api/promotions` | Create promotion watcher | Supabase bearer token |
+| `GET` | `/api/promotions/<id>` | Read watcher status | Supabase bearer token |
+| `POST` | `/api/promo-codes/redeem` | Redeem and schedule follow-up | Supabase bearer token |
+| `POST` | `/api/followups/process-due` | Compatibility follow-up runner | Cron secret |
 
-The `/api/*` routes also answer CORS preflight requests. Localhost is allowed by default. A deployed dashboard must exactly match `FRONTEND_ORIGIN`.
+Staff errors use `{ "error", "code", "request_id" }`. Successful response bodies and existing paths are unchanged.
 
-## Authentication and tenant access
+## Security controls
 
-The frontend sends its Supabase access token as `Authorization: Bearer <token>`.
+Meta signs the exact raw POST body with the app secret. The backend calculates an HMAC-SHA256 digest and compares it with `X-Hub-Signature-256` using a constant-time comparison. Missing, malformed, or incorrect signatures return `401` before any database write.
 
-For a protected request, the backend:
+Twilio webhook validation is enabled by default. `ProxyFix` reconstructs the public scheme and host before the Twilio validator sees the URL, which is important behind Render's proxy.
 
-1. Sends the token to Supabase Auth's `/auth/v1/user` endpoint.
-2. Reads the authenticated user ID.
-3. Looks up the requested Instagram account.
-4. Checks for a matching `business_users` membership.
-5. Continues only if the user belongs to that business.
+Other controls include:
 
-The browser also reads `businesses` and `instagram_accounts` directly from Supabase. The row-level security policies in `database/schema.sql` limit those reads to business members.
+- 1 MB request limit
+- Exact CORS origin matching; production does not add localhost automatically
+- Input count and length limits
+- Supabase token and business-membership checks on staff APIs
+- Request IDs on every response
+- Structured JSON logs that redact secrets, authorization headers, messages, phone numbers, and common PII fields
+- Service-role-only access to queue tables and claim functions
 
-## Instagram DM flow
+The service-role key bypasses row-level security. It must exist only in the backend and worker.
 
-`POST /webhook` treats an entry with a non-empty `messaging` array as DM-related.
+## Durable webhook queue
 
-The parser ignores:
+Each Meta delivery may contain multiple entries and events. `expand_meta_events` creates one small job for every DM or comment event. Meta message IDs and comment IDs become deterministic external event IDs; a stable hash is used only when Meta does not include one.
 
-- Read receipts
-- Echoes created by the business account
-- Messages without text
-- Invalid or incomplete payloads
+`webhook_jobs` has a unique `(provider, external_event_id)` constraint. Duplicate delivery inserts are ignored, so only one customer-facing workflow runs for an event.
 
-For a valid text DM with Supabase configured, the backend:
+`claim_webhook_jobs` uses `FOR UPDATE SKIP LOCKED` inside a service-role-only function. A claim:
 
-1. Finds `instagram_accounts` using the webhook's `entry.id`.
-2. Creates or updates the sender in `ig_contacts`.
-3. Creates or reuses one open `ig_dm_sessions` row for the contact.
-4. Rejects a duplicate `instagram_message_id`.
-5. Saves the inbound message.
-6. Checks whether the contact has an active promotion lead.
-7. If there is no active lead, retrieves recent conversation history and relevant knowledge.
-8. Generates a reply with OpenAI.
-9. Stores the assistant message and sends it through the Instagram Graph API.
-10. Updates the session state and last-activity time.
+- Changes the job to `processing`
+- Increments its attempt count
+- Sets the worker ID and five-minute lease
+- Can reclaim a processing job after its lease expires
 
-If Supabase is not configured, DMs use an in-memory history dictionary. This fallback is useful for basic development but loses all data on restart and does not support promotion automation.
+Known transient workflow failures retry up to five attempts after 2, 10, 30, 120, and 300 seconds. Successful and intentionally ignored jobs become terminal and their raw payload is replaced with `{}`. Terminal failures retain their payload for diagnosis and are deleted after seven days by default.
 
-### RAG retrieval
+Outbound Instagram and Twilio mutations are never automatically retried because a network error can leave delivery status ambiguous. Only safe GET/HEAD integrations use the shared HTTP retry policy.
 
-For normal DMs, restaurant-intent promotion copy, and SMS replies, `retrieve_knowledge_context`:
+## Promotion polling
 
-1. Embeds the incoming text with `text-embedding-3-small` by default.
-2. Calls the `match_knowledge_chunks` Supabase RPC.
-3. Restricts matches to the current `instagram_account_id`.
-4. Selects the closest vectors by cosine distance.
-5. Adds up to `RAG_MATCH_COUNT` chunks to the OpenAI instructions.
+Creating a promotion records the current media baseline and an `ig_promotion_setups` row. It does not create a thread.
 
-RAG is enabled by default. If embedding or retrieval fails, the failure is logged and message generation continues without knowledge context.
+The worker atomically claims due setup rows. One tick checks for a new post, then either:
 
-## Comment and promotion flow
+- Creates the promotional post and marks the setup `found`
+- Marks it `expired` after five minutes
+- Releases the lease and sets `next_poll_at` 30 seconds ahead
 
-An entry containing `changes` is treated as comment-related. The comment parser extracts the comment ID, media ID, text, commenter, and timestamp. Self-comments and incomplete events are ignored.
+Abandoned setup leases become claimable after five minutes. The frontend may continue polling the existing status API every five seconds.
 
-The backend stores the comment, then checks that its `ig_posts` record is:
+## DM and comment processing
 
-- Marked `promotional`
-- Enabled for automation
-- Inside its optional start and end time
-- Not already automated for the same post and contact
+DM events reject echoes, receipts, incomplete records, and duplicate Meta message IDs. A valid message is stored with its contact and session. If the contact is collecting a promotion, lead extraction runs first. Otherwise the workflow retrieves account knowledge, generates a response, stores it, and sends it through Instagram.
 
-### Trigger modes
+Comment events are checked against an enabled promotional post and its active time window. Only one automation is allowed per post/contact pair.
 
-Each promotional post has one of three modes:
+Trigger modes:
 
-#### `keywords`
+- `keywords`: case-insensitive substring match; no classifier call
+- `restaurant_intent`: structured OpenAI classification
+- `keywords_or_restaurant_intent`: keywords first, classifier only if needed
 
-The comment triggers when any configured keyword appears anywhere in the text. Matching is case-insensitive and uses substring matching. No OpenAI classification is performed.
+The unchanged restaurant classifier recognizes positive or neutral menu, dietary, pricing, hours, location, reservation, availability, buying-interest, and experience comments. It rejects complaints, spam, tag-only, emoji-only, and unrelated comments. Results must pass the configured confidence threshold and are stored in `ig_comment_classifications`. Classifier errors fail closed.
 
-#### `restaurant_intent`
+After a match, the workflow creates the contact, promo code, and lead, then sends a public reply and private lead-capture message. Restaurant-intent copy uses retrieved knowledge with deterministic fallback copy.
 
-OpenAI returns structured JSON containing:
+## Knowledge retrieval
 
-- `should_trigger`
-- `category`
-- `confidence`
-- `reasoning`
+The backend embeds the incoming text with `text-embedding-3-small` by default and calls `match_knowledge_chunks`. The database limits results to the selected Instagram account and sorts by vector similarity. Retrieval failures are recorded without blocking a safe fallback reply.
 
-The current prompt accepts positive or neutral restaurant intent such as menu, dietary, pricing, hours, location, reservation, availability, purchase-interest, or positive-experience comments. Complaints, negative feedback, spam, tag-only comments, emoji-only comments, and unrelated text should not trigger.
+## Promo codes and SMS
 
-A comment triggers only when:
+Lead extraction returns a customer name and phone from DM history. Phone normalization accepts E.164-like values and US/Canada 10- or 11-digit values. Once complete, the code is sent through Twilio.
 
-- OpenAI reports `should_trigger=true`
-- Confidence is at least `COMMENT_CLASSIFIER_MIN_CONFIDENCE` (default `0.65`)
-- The normalized category is not `spam_or_unrelated` or `complaint_or_negative`
+Redemption returns one of `redeemed`, `expired`, `already_redeemed`, `void`, or `not_found`. A successful redemption updates the customer profile and creates one due follow-up row. The worker-safe SMS service changes `pending` to `sending` before delivery; another worker cannot claim it. A delivery with an ambiguous result is not retried automatically.
 
-Classification attempts are stored in `ig_comment_classifications`. Errors fail closed, so a classifier failure does not send a message or issue a code.
+Inbound SMS messages are deduplicated by Twilio SID. Standard stop words (`STOP`, `STOPALL`, `UNSUBSCRIBE`, `CANCEL`, `END`, and `QUIT`) close the conversation before AI generation.
 
-#### `keywords_or_restaurant_intent`
+The protected follow-up endpoint and `process_due_followups.py` remain available for compatibility and use the same service functions as the worker.
 
-Keywords are checked first. OpenAI is called only when no keyword matches.
+To invoke the compatibility script manually:
 
-### Actions after a match
-
-After a qualifying comment, the backend:
-
-1. Creates or reuses the contact.
-2. Creates one promo code for the post/contact pair.
-3. Creates a promotion lead in the `collecting` state.
-4. Sends a public comment reply.
-5. Sends a private reply asking for the customer's name and phone number.
-6. Stores message IDs and the final automation status.
-
-Keyword triggers use the configured static public reply and standard lead-capture DM. Restaurant-intent triggers retrieve business knowledge and ask OpenAI to write both messages. If copy generation fails, they fall back to the configured reply and standard lead-capture message.
-
-The public reply is limited to 220 characters and is adjusted to mention the DM inbox. Only one automation attempt is allowed per post/contact pair.
-
-## Promotion setup polling
-
-`POST /api/promotions` does not require staff to paste a media ID. Instead it:
-
-1. Fetches and stores currently unknown Instagram media as regular posts.
-2. Takes a snapshot of all known media IDs.
-3. Creates an `ig_promotion_setups` row.
-4. Starts a background thread.
-5. Polls Instagram every 30 seconds for up to five minutes.
-6. Converts the newest unseen media item into an enabled promotional post.
-
-Only one pending or polling setup is allowed per Instagram account. The frontend polls the setup-status route every five seconds.
-
-This polling runs inside the Flask process. A process restart or multi-instance deployment can interrupt it; a production version should move this work to a durable job queue.
-
-## Promotion lead capture
-
-Incoming DMs are checked for an active `ig_promo_leads` row before the normal chatbot runs.
-
-OpenAI attempts to extract `customer_name` and `phone` as JSON from recent DM history. The backend also has simple cleanup and phone fallback logic. Phone normalization currently supports:
-
-- Numbers already beginning with `+`, with 8 to 15 digits
-- Ten-digit US/Canada numbers, converted to `+1...`
-- Eleven-digit US/Canada numbers beginning with `1`
-
-If either value is missing, the Instagram reply asks only for the missing information. When both are available, the backend records SMS consent time, stores the contact details, sends the code through Twilio, and marks the lead `code_sms_sent` or `code_sms_failed`.
-
-## Promo-code redemption and follow-up
-
-The redemption route checks the code inside the selected Instagram account. Its response distinguishes:
-
-- `redeemed`
-- `expired`
-- `already_redeemed`
-- `void`
-- `not_found`
-
-A successful redemption records the staff user and optional notes, updates or creates the customer's profile, and creates one `post_redemption_followup` SMS row. OpenAI writes a short follow-up using the customer's first name and staff notes; deterministic text is used if generation fails.
-
-The message is scheduled for `FOLLOWUP_DELAY_MINUTES` after redemption. It is not sent by an in-process timer.
-
-The cron job runs `process_due_followups.py`, which calls:
-
-```text
-POST /api/followups/process-due
-X-Followup-Cron-Secret: <FOLLOWUP_CRON_SECRET>
+```bash
+BACKEND_URL=https://your-backend.example.com \
+FOLLOWUP_CRON_SECRET=your-shared-secret \
+python backend/process_due_followups.py
 ```
-
-The endpoint finds due messages, claims each by changing it from `pending` to `sending`, sends it through Twilio, and marks it `sent` or `failed`.
-
-## Inbound SMS flow
-
-Twilio posts customer replies to `/api/twilio/sms-webhook`.
-
-The backend:
-
-1. Validates the Twilio signature when `TWILIO_VALIDATE_SIGNATURE` is true.
-2. Deduplicates messages by Twilio SID.
-3. Finds the newest promotion lead with the sender's normalized phone number.
-4. Ignores numbers that do not belong to a known lead.
-5. Creates or reuses an SMS conversation.
-6. Closes the conversation for standard stop words such as `STOP` or `CANCEL`.
-7. Otherwise loads history and account knowledge, generates a concise reply, sends it, and stores both sides.
-
-## OpenAI behavior
-
-`openai_client.py` uses:
-
-- `gpt-4o-mini` as the default text model
-- `text-embedding-3-small` as the default embedding model
-- Up to 20 recent messages of conversation history
-- Account-specific `instagram_accounts.system_prompt` instructions when available
-
-OpenAI is used for general replies, restaurant comment classification, dynamic promotion copy, lead extraction, and redemption follow-ups. Generation functions return structured success/error metadata so callers can record model, response ID, token usage, latency, and fallbacks.
-
-## Database model
-
-The main relationship is:
-
-```text
-businesses
-├── business_users ── profiles/auth.users
-└── instagram_accounts
-    ├── knowledge_chunks
-    ├── ig_contacts
-    │   ├── ig_dm_sessions ── ig_dm_messages
-    │   ├── ig_promo_leads
-    │   ├── ig_sms_conversations ── ig_sms_conversation_messages
-    │   └── ig_customer_profiles
-    └── ig_posts
-        ├── ig_comments ── ig_comment_classifications
-        └── ig_promo_codes ── ig_sms_messages
-```
-
-See `database/schema.sql` for the complete set of tables, constraints, indexes, and policies.
 
 ## Configuration
 
-### Required for the main backend
+Copy `backend/.env.example` to `backend/.env`. It loads automatically for both the web process and worker.
 
-```env
-SUPABASE_URL=
-SUPABASE_SERVICE_ROLE_KEY=
-SUPABASE_ANON_KEY=
-OPENAI_API_KEY=
-INSTAGRAM_ACCESS_TOKEN=
-META_VERIFY_TOKEN=
-FRONTEND_ORIGIN=http://localhost:5173
-```
+Core production variables:
 
-### Required for SMS and scheduled follow-up
+| Variable | Purpose |
+| --- | --- |
+| `APP_ENV` | `development`, `test`, or `production` |
+| `META_VERIFY_TOKEN` | Meta subscription challenge secret |
+| `META_APP_SECRET` | Meta POST signature secret |
+| `INSTAGRAM_ACCESS_TOKEN` | Instagram Graph API token |
+| `SUPABASE_URL` | Project URL |
+| `SUPABASE_SERVICE_ROLE_KEY` | Server-only database key |
+| `SUPABASE_ANON_KEY` | Token verification key |
+| `OPENAI_API_KEY` | AI and embedding access |
+| `FRONTEND_ORIGINS` | Comma-separated exact CORS origins |
+| `LOG_LEVEL` | JSON log level; default `INFO` |
 
-```env
-TWILIO_ACCOUNT_SID=
-TWILIO_AUTH_TOKEN=
-TWILIO_MESSAGING_SERVICE_SID=
-FOLLOWUP_CRON_SECRET=
-```
+`FRONTEND_ORIGIN` is still accepted when `FRONTEND_ORIGINS` is absent.
 
-### Optional
+Worker variables:
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `OPENAI_MODEL` | `gpt-4o-mini` | Text generation and extraction model |
-| `COMMENT_CLASSIFIER_MODEL` | `OPENAI_MODEL` | Comment classification model |
-| `COMMENT_CLASSIFIER_MIN_CONFIDENCE` | `0.65` | Minimum restaurant-intent confidence |
-| `OPENAI_EMBEDDING_MODEL` | `text-embedding-3-small` | Query embedding model |
-| `OPENAI_SYSTEM_PROMPT` | Built-in assistant prompt | Fallback account instructions |
-| `OPENAI_FALLBACK_MESSAGE` | Built-in thank-you message | DM fallback text |
-| `RAG_ENABLED` | `true` | Enables vector retrieval |
-| `RAG_MATCH_COUNT` | `5` | Maximum retrieved chunks |
-| `FOLLOWUP_DELAY_MINUTES` | `10` | Delay after redemption |
-| `FOLLOWUP_BATCH_SIZE` | `20` | Due messages processed per call |
-| `TWILIO_VALIDATE_SIGNATURE` | `true` | Validates incoming Twilio requests |
-| `PORT` | `5000` | Flask listening port |
+| Variable | Default |
+| --- | --- |
+| `WORKER_POLL_SECONDS` | `2` |
+| `WORKER_BATCH_SIZE` | `10` |
+| `WORKER_MAX_ATTEMPTS` | `5` |
+| `WEBHOOK_FAILURE_RETENTION_DAYS` | `7` |
+| `WORKER_LEASE_SECONDS` | `300` |
 
-`app.py` does not currently call `load_dotenv`. Export the file before starting locally:
+SMS needs `TWILIO_ACCOUNT_SID`, `TWILIO_AUTH_TOKEN`, and `TWILIO_MESSAGING_SERVICE_SID`. Keep `TWILIO_VALIDATE_SIGNATURE=true`. The compatibility endpoint also needs `FOLLOWUP_CRON_SECRET`.
 
-```bash
-set -a
-source backend/.env
-set +a
-python backend/app.py
-```
+Production startup fails immediately when Meta, Instagram, Supabase, or OpenAI core settings are missing.
 
 ## Local development
 
 From the repository root:
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
-python -m pip install -r backend/requirements.txt
-
-set -a
-source backend/.env
-set +a
-
-python backend/app.py
+make setup
+cp backend/.env.example backend/.env
+.venv/bin/python backend/app.py
 ```
 
-Test the health route:
+Run the worker in another terminal:
 
 ```bash
-curl http://127.0.0.1:5000/
+cd backend
+../.venv/bin/python -m christa_ig.worker
 ```
 
-Test Meta verification:
+## Automated testing
 
 ```bash
-curl "http://127.0.0.1:5000/webhook?hub.mode=subscribe&hub.verify_token=YOUR_TOKEN&hub.challenge=12345"
+.venv/bin/python -m ruff check backend embeddings
+.venv/bin/python -m pytest
 ```
 
-## Deployment notes
+The coverage gate is 80% for the extracted backend package, which is stricter than the project's 70% minimum. Each new worker, event, security, configuration, and transport module is currently above 80%. CI also audits production dependencies and replays the full database migration chain.
 
-`render.yaml` defines:
+Database tests:
 
-- A Flask web service
-- A cron service that processes follow-ups every five minutes
-
-Set all secrets in the hosting platform rather than committing `.env`. The cron service also needs:
-
-```env
-BACKEND_URL=https://your-backend.example.com
-FOLLOWUP_CRON_SECRET=the-same-value-as-the-web-service
+```bash
+supabase start
+supabase db reset
+supabase test db
 ```
 
-The backend logs webhook payloads and processing metadata. Payloads can contain personal or sensitive data, so production logging should be reduced or sanitized.
+## Migrations
 
-## Current limitations
+- `supabase/migrations/20260907000000_initial_schema.sql`: versioned baseline for a new project
+- `supabase/migrations/20260907001000_production_hardening.sql`: additive queue, lease, index, and claim-function changes
+- `database/schema.sql`: synchronized full snapshot for a fresh installation
 
-- Meta webhook signature validation is not implemented for `POST /webhook`.
-- Webhook work, including OpenAI and outbound network calls, runs synchronously.
-- Promotion polling uses an in-process thread rather than a durable worker.
-- The intent classifier is restaurant-specific.
-- Phone normalization is primarily designed for US/Canada numbers.
-- There is no automated test suite yet.
+For future changes, add a new migration. Never edit a migration that has already been applied.
+
+## Production commands
+
+Web:
+
+```bash
+gunicorn --chdir backend --workers 2 --threads 4 --timeout 60 --access-logfile - app:app
+```
+
+Worker:
+
+```bash
+cd backend && python -m christa_ig.worker
+```
+
+`render.yaml` includes these commands, liveness checks, graceful shutdown, secrets, and a paid continuously running worker.
+
+## Known product limits
+
+- The AI intent classifier remains restaurant-specific.
+- Phone normalization is mainly designed for US/Canada numbers.
+- Business and Instagram account onboarding is still managed outside the dashboard.
+- This repository does not include a public demo mode or deployment credentials.
