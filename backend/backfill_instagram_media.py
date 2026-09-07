@@ -11,11 +11,13 @@ import urllib.request
 from datetime import datetime, timezone
 from typing import Any, Dict, Iterable, List, Optional
 
+from christa_ig.http_client import perform_request
 from supabase_client import get_instagram_account_by_id, upsert_instagram_post
 
 try:
     from dotenv import load_dotenv
 except ImportError:  # pragma: no cover - dependency is optional for deployed/script envs.
+
     def load_dotenv() -> bool:
         return False
 
@@ -62,18 +64,20 @@ def fetch_json(url: str, access_token: str) -> Dict[str, Any]:
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            return json.loads(response.read().decode("utf-8"))
+        response = perform_request(request, timeout=30, retry_safe=True)
+        return json.loads(response.body.decode("utf-8"))
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         raise RuntimeError(f"Instagram media fetch failed: {exc.code} {body}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"Instagram media fetch failed: {exc.reason}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        raise RuntimeError(f"Instagram media fetch failed: {getattr(exc, 'reason', exc)}") from exc
     except json.JSONDecodeError as exc:
         raise RuntimeError(f"Instagram media fetch returned invalid JSON: {exc}") from exc
 
 
-def iter_instagram_media(instagram_user_id: str, access_token: str, limit: Optional[int] = None) -> Iterable[Dict[str, Any]]:
+def iter_instagram_media(
+    instagram_user_id: str, access_token: str, limit: Optional[int] = None
+) -> Iterable[Dict[str, Any]]:
     query = urllib.parse.urlencode(
         {
             "fields": MEDIA_FIELDS,

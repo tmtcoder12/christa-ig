@@ -122,7 +122,9 @@ def ingest_jsonl_items(
 
         texts = [item["text"] for item in batch]
         embeddings = embed_texts(local_client, texts)
-        rows = [_build_row(item, emb, instagram_account_id=account_id) for item, emb in zip(batch, embeddings)]
+        rows = [
+            _build_row(item, emb, instagram_account_id=account_id) for item, emb in zip(batch, embeddings, strict=False)
+        ]
         local_store.upsert_knowledge_chunks(rows)
 
         for row in rows:

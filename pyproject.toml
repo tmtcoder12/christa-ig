@@ -1,0 +1,24 @@
+[tool.ruff]
+target-version = "py312"
+line-length = 120
+extend-exclude = [".venv", "myenv", "frontend-login"]
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["backend/tests"]
+addopts = "--cov=christa_ig --cov-report=term-missing --cov-fail-under=80"
+pythonpath = ["backend"]
+
+[tool.coverage.run]
+branch = true
+source = ["christa_ig"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+exclude_also = [
+  "if TYPE_CHECKING:",
+  "if __name__ == .__main__.:",
+]

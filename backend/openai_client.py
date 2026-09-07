@@ -3,7 +3,6 @@ import os
 
 from openai import OpenAI
 
-
 DEFAULT_MODEL = "gpt-4o-mini"
 DEFAULT_EMBEDDING_MODEL = "text-embedding-3-small"
 DEFAULT_SYSTEM_PROMPT = "You are a helpful assistant responding to Instagram direct messages."
@@ -309,8 +308,7 @@ def generate_restaurant_intent_promo_messages(
 
     formatted_context = _format_knowledge_context(knowledge_context)
     promotion_hint = (
-        f"The promo code prefix/context is {code_prefix}. "
-        "Do not include the actual code because it is texted later."
+        f"The promo code prefix/context is {code_prefix}. Do not include the actual code because it is texted later."
         if code_prefix
         else "There is a promo code available, but do not include it because it is texted later."
     )

@@ -8,8 +8,8 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, timedelta, timezone
 
+from christa_ig.http_client import DEFAULT_TIMEOUT_SECONDS, perform_request
 
-DEFAULT_TIMEOUT_SECONDS = 10
 PROMO_CODE_ALPHABET = string.ascii_uppercase + string.digits
 PROMO_CODE_SUFFIX_LENGTH = 6
 PROMO_CODE_MAX_ATTEMPTS = 8
@@ -18,7 +18,13 @@ PROMOTION_SETUP_SELECT = (
     "automation_starts_at,automation_ends_at,promo_code_valid_duration_hours,"
     "comment_reply_text,dm_prompt,code_prefix,baseline_media_ids,status,post_id,"
     "found_instagram_media_id,found_caption,error_message,poll_started_at,"
-    "poll_expires_at,last_polled_at,found_at,extra_metadata,created_at,updated_at"
+    "poll_expires_at,last_polled_at,found_at,next_poll_at,locked_at,locked_until,"
+    "locked_by,worker_attempt_count,last_worker_error,extra_metadata,created_at,updated_at"
+)
+WEBHOOK_JOB_SELECT = (
+    "id,provider,external_event_id,event_type,account_external_id,payload,status,"
+    "attempt_count,available_at,locked_at,locked_until,locked_by,error_code,"
+    "error_message,request_id,completed_at,created_at,updated_at"
 )
 KNOWLEDGE_CHUNK_SELECT = (
     "id,instagram_account_id,text,type,source_url,page_path,title,"
@@ -54,8 +60,7 @@ CUSTOMER_PROFILE_SELECT = (
     "created_at,updated_at"
 )
 COMMENT_CLASSIFICATION_SELECT = (
-    "id,comment_id,business_id,model,classification,confidence,reasoning,status,"
-    "error_message,classified_at"
+    "id,comment_id,business_id,model,classification,confidence,reasoning,status,error_message,classified_at"
 )
 
 
@@ -113,16 +118,21 @@ def _request(method, path, params=None, payload=None, prefer=None):
     api_request = urllib.request.Request(url, data=data, headers=headers, method=method)
 
     try:
-        with urllib.request.urlopen(api_request, timeout=DEFAULT_TIMEOUT_SECONDS) as response:
-            response_body = response.read().decode("utf-8")
-            if not response_body:
-                return None
-            return json.loads(response_body)
+        response = perform_request(
+            api_request,
+            timeout=DEFAULT_TIMEOUT_SECONDS,
+            retry_safe=method in {"GET", "HEAD"},
+        )
+        response_body = response.body.decode("utf-8")
+        if not response_body:
+            return None
+        return json.loads(response_body)
     except urllib.error.HTTPError as exc:
         error_body = exc.read().decode("utf-8", errors="replace")
         raise SupabaseError(f"Supabase {method} {path} failed: {exc.code} {error_body}") from exc
-    except urllib.error.URLError as exc:
-        raise SupabaseError(f"Supabase {method} {path} failed: {exc.reason}") from exc
+    except (urllib.error.URLError, TimeoutError) as exc:
+        reason = getattr(exc, "reason", exc)
+        raise SupabaseError(f"Supabase {method} {path} failed: {reason}") from exc
     except json.JSONDecodeError as exc:
         raise SupabaseError(f"Supabase {method} {path} returned invalid JSON: {exc}") from exc
 
@@ -320,7 +330,10 @@ def update_contact_sms_details(contact_id, customer_name=None, phone_raw=None, p
 
     rows = _patch_returning(
         "ig_contacts",
-        {"id": f"eq.{contact_id}", "select": "id,instagram_account_id,instagram_user_id,username,display_name,phone_raw,phone_e164,sms_consent_at"},
+        {
+            "id": f"eq.{contact_id}",
+            "select": "id,instagram_account_id,instagram_user_id,username,display_name,phone_raw,phone_e164,sms_consent_at",
+        },
         patch,
     )
     return rows[0] if rows else None
@@ -1033,6 +1046,116 @@ def update_promotion_setup(setup_id, patch):
     return rows[0] if rows else None
 
 
+def claim_promotion_setups(batch_size, worker_id, lease_seconds=300):
+    return (
+        _rpc(
+            "claim_promotion_setups",
+            {
+                "p_batch_size": batch_size,
+                "p_worker_id": worker_id,
+                "p_lease_seconds": lease_seconds,
+            },
+        )
+        or []
+    )
+
+
+def enqueue_webhook_jobs(jobs, request_id=None):
+    if not jobs:
+        return []
+    rows = [{**job, "request_id": request_id} for job in jobs]
+    return (
+        _request(
+            "POST",
+            "webhook_jobs",
+            params={"on_conflict": "provider,external_event_id"},
+            payload=rows,
+            prefer="resolution=ignore-duplicates,return=representation",
+        )
+        or []
+    )
+
+
+def claim_webhook_jobs(batch_size, worker_id, lease_seconds=300):
+    return (
+        _rpc(
+            "claim_webhook_jobs",
+            {
+                "p_batch_size": batch_size,
+                "p_worker_id": worker_id,
+                "p_lease_seconds": lease_seconds,
+            },
+        )
+        or []
+    )
+
+
+def complete_webhook_job(job_id, status="succeeded", error_code=None, error_message=None):
+    patch = {
+        "status": status,
+        "payload": {},
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "locked_at": None,
+        "locked_until": None,
+        "locked_by": None,
+        "error_code": error_code,
+        "error_message": error_message,
+    }
+    rows = _patch_returning(
+        "webhook_jobs",
+        {"id": f"eq.{job_id}", "select": WEBHOOK_JOB_SELECT},
+        patch,
+    )
+    return rows[0] if rows else None
+
+
+def retry_webhook_job(job_id, available_at, error_code, error_message):
+    rows = _patch_returning(
+        "webhook_jobs",
+        {"id": f"eq.{job_id}", "select": WEBHOOK_JOB_SELECT},
+        {
+            "status": "queued",
+            "available_at": available_at,
+            "locked_at": None,
+            "locked_until": None,
+            "locked_by": None,
+            "error_code": error_code,
+            "error_message": str(error_message or "")[:2000],
+        },
+    )
+    return rows[0] if rows else None
+
+
+def fail_webhook_job(job_id, error_code, error_message):
+    rows = _patch_returning(
+        "webhook_jobs",
+        {"id": f"eq.{job_id}", "select": WEBHOOK_JOB_SELECT},
+        {
+            "status": "failed",
+            "completed_at": datetime.now(timezone.utc).isoformat(),
+            "locked_at": None,
+            "locked_until": None,
+            "locked_by": None,
+            "error_code": error_code,
+            "error_message": str(error_message or "")[:2000],
+        },
+    )
+    return rows[0] if rows else None
+
+
+def delete_expired_failed_webhook_jobs(retention_days):
+    cutoff = datetime.now(timezone.utc) - timedelta(days=retention_days)
+    return _request(
+        "DELETE",
+        "webhook_jobs",
+        params={
+            "status": "eq.failed",
+            "completed_at": f"lt.{cutoff.isoformat()}",
+        },
+        prefer="return=minimal",
+    )
+
+
 def get_comment_by_instagram_id(instagram_account_id, instagram_comment_id):
     return _fetch_one(
         "ig_comments",
@@ -1240,7 +1363,7 @@ def upsert_meta_webhook_event(
         "event_id": event_id,
         "business_id": business_id,
         "event_type": event_type,
-        "payload": payload or {},
+        "payload": summarize_webhook_payload(payload),
         "processing_status": processing_status,
         "processed_at": datetime.now(timezone.utc).isoformat(),
     }
@@ -1251,3 +1374,19 @@ def upsert_meta_webhook_event(
         row["error_message"] = error_message
 
     return _upsert("meta_webhook_events", row, "event_id")
+
+
+def summarize_webhook_payload(payload):
+    """Keep operational shape without duplicating message text or phone data."""
+    if not isinstance(payload, dict):
+        return {}
+    summary = {"keys": sorted(str(key) for key in payload.keys())}
+    if payload.get("object"):
+        summary["object"] = str(payload["object"])
+    entries = payload.get("entry")
+    if isinstance(entries, list):
+        summary["entry_count"] = len(entries)
+    message_sid = payload.get("MessageSid") or payload.get("SmsMessageSid") or payload.get("SmsSid")
+    if message_sid:
+        summary["message_sid"] = str(message_sid)
+    return summary

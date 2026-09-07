@@ -6,14 +6,13 @@ from pathlib import Path
 from typing import Any, Dict, List
 
 from dotenv import load_dotenv
-from openai import OpenAI
-
 from ingest_jsonl_items import (
     EMBED_MODEL,
     create_supabase_store_from_env,
     ingest_jsonl_items,
     require_instagram_account_id,
 )
+from openai import OpenAI
 
 
 def parse_bool_env(name: str, default: bool) -> bool:

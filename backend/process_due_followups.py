@@ -4,6 +4,8 @@ import sys
 import urllib.error
 import urllib.request
 
+from christa_ig.http_client import perform_request
+
 
 def required_env(name):
     value = os.environ.get(name, "").strip()
@@ -22,11 +24,11 @@ def main():
     )
 
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:
-            body = response.read().decode("utf-8")
-            print(body)
-            data = json.loads(body)
-            return 0 if response.status < 400 and "processed" in data else 1
+        response = perform_request(request, timeout=30)
+        body = response.body.decode("utf-8")
+        print(body)
+        data = json.loads(body)
+        return 0 if response.status < 400 and "processed" in data else 1
     except urllib.error.HTTPError as exc:
         body = exc.read().decode("utf-8", errors="replace")
         print(body or str(exc), file=sys.stderr)
