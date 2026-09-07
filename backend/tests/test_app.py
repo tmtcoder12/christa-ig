@@ -122,7 +122,10 @@ def test_twilio_validation_uses_proxy_aware_public_url(monkeypatch):
             captured.update(url=url, form=form, signature=signature)
             return True
 
+    monkeypatch.setenv("TWILIO_ACCOUNT_SID", "ACtest")
     monkeypatch.setenv("TWILIO_AUTH_TOKEN", "twilio-secret")
+    monkeypatch.setenv("TWILIO_MESSAGING_SERVICE_SID", "MGtest")
+    reset_settings_cache()
     monkeypatch.setattr(app_module, "RequestValidator", FakeValidator)
     monkeypatch.setattr(app_module, "is_supabase_configured", lambda: False)
     response = (
