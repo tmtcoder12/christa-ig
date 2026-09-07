@@ -1,14 +1,122 @@
+envVarGroups:
+  - name: christa-ig-runtime
+    envVars:
+      - key: APP_ENV
+        value: production
+      - key: LOG_LEVEL
+        value: INFO
+      - key: PYTHON_VERSION
+        value: 3.12.7
+      - key: WORKER_POLL_SECONDS
+        value: "2"
+      - key: WORKER_BATCH_SIZE
+        value: "10"
+      - key: WORKER_MAX_ATTEMPTS
+        value: "5"
+      - key: WEBHOOK_FAILURE_RETENTION_DAYS
+        value: "7"
+      - key: WORKER_LEASE_SECONDS
+        value: "300"
+      - key: TWILIO_VALIDATE_SIGNATURE
+        value: "true"
+      - key: FOLLOWUP_DELAY_MINUTES
+        value: "10"
+      - key: FOLLOWUP_BATCH_SIZE
+        value: "20"
+
 services:
   - type: web
-    name: python-webhook
+    name: christa-ig-api
     runtime: python
     plan: free
     buildCommand: pip install -r backend/requirements.txt
-    startCommand: python backend/app.py
-  - type: cron
-    name: process-promo-followups
+    startCommand: gunicorn --chdir backend --workers 2 --threads 4 --timeout 60 --access-logfile - app:app
+    healthCheckPath: /health/live
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - fromGroup: christa-ig-runtime
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: INSTAGRAM_ACCESS_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_MESSAGING_SERVICE_SID
+        sync: false
+      - key: FOLLOWUP_CRON_SECRET
+        sync: false
+
+  - type: worker
+    name: christa-ig-worker
     runtime: python
-    plan: starter
-    schedule: "*/5 * * * *"
-    buildCommand: python --version
-    startCommand: python backend/process_due_followups.py
+    plan: 0.5c-512mb
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && python -m christa_ig.worker
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - fromGroup: christa-ig-runtime
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: INSTAGRAM_ACCESS_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_MESSAGING_SERVICE_SID
+        sync: false
+
+  - type: web
+    name: christa-ig-frontend
+    runtime: static
+    buildCommand: cd frontend-login && npm ci && npm run build
+    staticPublishPath: frontend-login/dist
+    envVars:
+      - key: NODE_VERSION
+        value: 22.13.0
+      - key: VITE_SUPABASE_URL
+        sync: false
+      - key: VITE_SUPABASE_ANON_KEY
+        sync: false
+      - key: VITE_BACKEND_URL
+        sync: false
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+    headers:
+      - path: /*
+        name: X-Content-Type-Options
+        value: nosniff
+      - path: /*
+        name: Referrer-Policy
+        value: strict-origin-when-cross-origin
+      - path: /*
+        name: Permissions-Policy
+        value: camera=(), microphone=(), geolocation=()
