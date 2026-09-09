@@ -241,7 +241,9 @@ Worker:
 cd backend && python -m christa_ig.worker
 ```
 
-`render.yaml` includes these commands, liveness checks, graceful shutdown, secrets, and a paid continuously running worker.
+`render.yaml` is the free portfolio-demo topology: Render hosts the web API and static frontend, while the worker runs locally during recording. The free web service omits the unsupported graceful-shutdown setting.
+
+`render.production.yaml` is the optional always-on topology. It uses paid Render services for both the API and continuous worker and enables graceful shutdown. Use only one of these Blueprint files to manage the services.
 
 ## Known product limits
 

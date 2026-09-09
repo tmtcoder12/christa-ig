@@ -1,5 +1,5 @@
-# Free-tier topology for a short portfolio demo.
-# Run `python -m christa_ig.worker` locally while recording.
+# Paid, always-on topology. Use this Blueprint instead of render.yaml when the
+# worker and graceful shutdown behavior need to run continuously on Render.
 envVarGroups:
   - name: christa-ig-runtime
     envVars:
@@ -30,10 +30,11 @@ services:
   - type: web
     name: christa-ig-api
     runtime: python
-    plan: free
+    plan: 0.5c-512mb
     buildCommand: pip install -r backend/requirements.txt
     startCommand: gunicorn --chdir backend --workers 2 --threads 4 --timeout 60 --access-logfile - app:app
     healthCheckPath: /health/live
+    maxShutdownDelaySeconds: 60
     envVars:
       - fromGroup: christa-ig-runtime
       - key: FRONTEND_ORIGINS
@@ -59,6 +60,38 @@ services:
       - key: TWILIO_MESSAGING_SERVICE_SID
         sync: false
       - key: FOLLOWUP_CRON_SECRET
+        sync: false
+
+  - type: worker
+    name: christa-ig-worker
+    runtime: python
+    plan: 0.5c-512mb
+    buildCommand: pip install -r backend/requirements.txt
+    startCommand: cd backend && python -m christa_ig.worker
+    maxShutdownDelaySeconds: 60
+    envVars:
+      - fromGroup: christa-ig-runtime
+      - key: FRONTEND_ORIGINS
+        sync: false
+      - key: META_VERIFY_TOKEN
+        sync: false
+      - key: META_APP_SECRET
+        sync: false
+      - key: INSTAGRAM_ACCESS_TOKEN
+        sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_SERVICE_ROLE_KEY
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: TWILIO_ACCOUNT_SID
+        sync: false
+      - key: TWILIO_AUTH_TOKEN
+        sync: false
+      - key: TWILIO_MESSAGING_SERVICE_SID
         sync: false
 
   - type: web

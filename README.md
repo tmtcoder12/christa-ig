@@ -120,15 +120,23 @@ supabase db reset
 supabase test db
 ```
 
-## Production deployment
+## Render deployment
 
-`render.yaml` defines:
+For a free portfolio-video deployment, `render.yaml` defines:
 
 - A Gunicorn web service with health checks
-- A continuously running background worker
 - A static React site with SPA routing and security headers
 
-Create a Render Blueprint from the repository and enter every value marked `sync: false`. Run the Supabase migrations before sending production traffic. The worker is a paid service.
+Create a Render Blueprint from the repository and enter every value marked `sync: false`. Keep the local worker running while recording:
+
+```bash
+cd backend
+../.venv/bin/python -m christa_ig.worker
+```
+
+Free web services may need time to wake up, so open `/health/live` shortly before recording. `render.production.yaml` is the optional always-on configuration with a paid web service and paid background worker. Use one Blueprint file or the other, not both, for the same services.
+
+Run the Supabase migrations before sending traffic in either setup.
 
 Health endpoints:
 
