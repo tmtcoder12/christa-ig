@@ -74,7 +74,7 @@ cp frontend-login/.env.example frontend-login/.env.local
 cp .env.example .env
 ```
 
-Fill in the backend and frontend values. Keep the Supabase service-role key, Meta app secret, OpenAI key, and Twilio credentials out of the frontend file.
+Fill in the backend and frontend values. Keep the Supabase service-role key, Instagram app secret, OpenAI key, and Twilio credentials out of the frontend file.
 
 ### 5. Run all three processes
 
@@ -103,7 +103,9 @@ Meta callback: https://YOUR_BACKEND/webhook
 Twilio SMS:    https://YOUR_BACKEND/api/twilio/sms-webhook
 ```
 
-Set the same Meta verification token in Meta and `META_VERIFY_TOKEN`. Set `META_APP_SECRET` to the Meta app secret so webhook signatures can be checked.
+Set the same webhook verification token in Meta and `META_VERIFY_TOKEN`.
+
+Set `META_APP_SECRET` to the **Instagram App Secret** shown under **Instagram → API setup with Instagram login**. The environment-variable name is kept for compatibility, but its value must be the Instagram-specific secret. Do not use the general App Secret from **App settings → Basic**. Using that secret causes real webhook deliveries to fail with `invalid_signature`.
 
 ## Checks and tests
 

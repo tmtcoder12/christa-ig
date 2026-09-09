@@ -67,7 +67,9 @@ Staff errors use `{ "error", "code", "request_id" }`. Successful response bodies
 
 ## Security controls
 
-Meta signs the exact raw POST body with the app secret. The backend calculates an HMAC-SHA256 digest and compares it with `X-Hub-Signature-256` using a constant-time comparison. Missing, malformed, or incorrect signatures return `401` before any database write.
+Meta signs the exact raw POST body with the Instagram App Secret. The backend calculates an HMAC-SHA256 digest and compares it with `X-Hub-Signature-256` using a constant-time comparison. Missing, malformed, or incorrect signatures return `401` before any database write.
+
+For Instagram API with Instagram Login, copy the secret from **Instagram → API setup with Instagram login → Instagram App Secret**. Store that value in `META_APP_SECRET`. Do not use the separate general App Secret under **App settings → Basic**; it will make genuine Instagram deliveries fail signature validation.
 
 Twilio webhook validation is enabled by default. `ProxyFix` reconstructs the public scheme and host before the Twilio validator sees the URL, which is important behind Render's proxy.
 
@@ -160,7 +162,7 @@ Core production variables:
 | --- | --- |
 | `APP_ENV` | `development`, `test`, or `production` |
 | `META_VERIFY_TOKEN` | Meta subscription challenge secret |
-| `META_APP_SECRET` | Meta POST signature secret |
+| `META_APP_SECRET` | Instagram App Secret used to validate webhook POSTs; get it from Instagram → API setup with Instagram login |
 | `INSTAGRAM_ACCESS_TOKEN` | Instagram Graph API token |
 | `SUPABASE_URL` | Project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | Server-only database key |
