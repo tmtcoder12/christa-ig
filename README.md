@@ -1,5 +1,7 @@
 # Christa IG
 
+[![CI](https://github.com/tmtcoder12/christa-ig/actions/workflows/ci.yml/badge.svg)](https://github.com/tmtcoder12/christa-ig/actions/workflows/ci.yml)
+
 Christa IG helps a business turn Instagram comments and messages into useful customer conversations.
 
 It can answer questions from the business's own knowledge, run comment-based promotions, collect customer details, send promo codes by SMS, and give staff a simple place to manage knowledge and redeem codes.
@@ -13,6 +15,8 @@ The first use case was a restaurant, but the same system can support:
 - Events promoting tickets or packages
 
 Keyword promotions work for any business. The optional AI comment classifier is still written for restaurant intent.
+
+This is a portfolio project that demonstrates a complete, production-minded integration. It requires your own Supabase, Meta, OpenAI, and optional Twilio credentials; no production credentials or customer data are included.
 
 ## Why the data matters
 
@@ -37,6 +41,33 @@ The repository provides an analytics-ready data foundation rather than a finishe
 - `render.yaml`: web, worker, and static-site deployment blueprint
 
 Instagram webhook events are verified and saved to a durable Supabase queue. A separate worker processes them, calls OpenAI when needed, and sends replies through Instagram or Twilio. This keeps slow or unreliable outside services out of the webhook request.
+
+## Engineering highlights
+
+- Idempotent webhook ingestion with deterministic event IDs and an atomic job-claim function
+- Durable background processing with bounded retries, worker leases, and abandoned-job recovery
+- Meta and Twilio signature validation before protected workflows run
+- Multi-tenant Supabase data access with row-level-security tests
+- Retrieval-augmented responses using account-specific knowledge embeddings
+- Structured, redacted logs with request IDs and consistent API errors
+- Typed React configuration, guarded routes, request timeouts, and safe retry rules
+- Automated backend, frontend, migration, and dependency checks in GitHub Actions
+
+## Architecture
+
+```mermaid
+flowchart LR
+    Customer[Instagram customer] -->|DM or comment| Meta[Meta webhooks]
+    Meta -->|signed event| API[Flask API]
+    API -->|durable enqueue| DB[(Supabase)]
+    Worker[Background worker] -->|atomic claim| DB
+    Worker -->|retrieve and generate| OpenAI[OpenAI]
+    Worker -->|reply| Instagram[Instagram API]
+    Worker -->|promo and follow-up| Twilio[Twilio SMS]
+    Staff[Business staff] --> Dashboard[React dashboard]
+    Dashboard -->|authenticated requests| API
+    Dashboard -->|RLS-protected queries| DB
+```
 
 ## Requirements
 

@@ -1,5 +1,8 @@
 __pycache__/
 *.py[cod]
+.DS_Store
+.idea/
+.vscode/
 .venv/
 myenv/
 .pytest_cache/
@@ -7,6 +10,7 @@ myenv/
 .coverage
 coverage.xml
 htmlcov/
+*.log
 
 .env
 .env.*
