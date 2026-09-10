@@ -14,6 +14,59 @@ The first use case was a restaurant, but the same system can support:
 
 Keyword promotions work for any business. The optional AI comment classifier is still written for restaurant intent.
 
+## Product walkthrough
+
+These screenshots use fictional demo data. Account names, contact details, and unrelated message history are intentionally blurred.
+
+### Knowledge-powered Instagram replies
+
+**1. Open the knowledge workspace.** Staff can add a fact, policy, service description, or FAQ answer for the assistant to use.
+
+[![Knowledge workspace for adding a business fact](docs/demo/knowledge-01.png)](docs/demo/knowledge-01.png)
+
+**2. Confirm the knowledge is ready.** The saved chunk is embedded and available for matching customer questions.
+
+[![Saved and embedded workout routine knowledge chunk](docs/demo/knowledge-02.png)](docs/demo/knowledge-02.png)
+
+<table>
+  <tr>
+    <td width="50%"><strong>3. Answer a matching question.</strong><br>The assistant retrieves the relevant knowledge and sends a grounded Instagram DM response.</td>
+    <td width="50%"><strong>4. Continue the conversation.</strong><br>The assistant can also handle a natural follow-up about the fitness business's services.</td>
+  </tr>
+  <tr>
+    <td><a href="docs/demo/knowledge-03.png"><img src="docs/demo/knowledge-03.png" alt="Instagram DM showing a grounded answer based on the saved workout routine" width="100%"></a></td>
+    <td><a href="docs/demo/knowledge-04.png"><img src="docs/demo/knowledge-04.png" alt="Instagram DM showing a conversational follow-up about personal training" width="100%"></a></td>
+  </tr>
+</table>
+
+### Comment-to-promo-code automation
+
+**1. Open the campaign configuration.** Staff choose how comments should trigger the promotion and prepare the campaign settings.
+
+[![Promotion configuration screen with keyword-comment trigger mode](docs/demo/promotion-01.png)](docs/demo/promotion-01.png)
+
+**2. Configure the offer.** This example listens for `FIT`, keeps codes valid for 24 hours, and gives each code the `FITNESS` prefix.
+
+[![Configured FIT promotion with validity period and FITNESS code prefix](docs/demo/promotion-02.png)](docs/demo/promotion-02.png)
+
+**3. Detect the post and respond to the trigger comment.** The automation attaches to the promotional post, recognizes the keyword, and leaves a public reply.
+
+[![Instagram post showing a FIT trigger comment and automated public reply](docs/demo/promotion-03.png)](docs/demo/promotion-03.png)
+
+**4. Capture the lead in Instagram DM.** The assistant collects the customer's name and phone number, then confirms that the code was sent.
+
+[![Instagram DM lead-capture flow with private details blurred](docs/demo/promotion-04.png)](docs/demo/promotion-04.png)
+
+**5. Deliver a unique promo code by SMS.** The customer receives a code that can be presented to the business.
+
+<p align="center">
+  <a href="docs/demo/promotion-05.png"><img src="docs/demo/promotion-05.png" alt="SMS containing the unique FITNESS promo code with earlier messages blurred" width="58%"></a>
+</p>
+
+**6. Redeem the code and schedule follow-up.** Staff validate the code, record the redemption, and create a follow-up time for the customer profile.
+
+[![Staff dashboard showing a successfully redeemed promo code and scheduled follow-up](docs/demo/promotion-06.png)](docs/demo/promotion-06.png)
+
 ## What is included
 
 - `frontend-login/`: React staff dashboard
