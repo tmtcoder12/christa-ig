@@ -168,7 +168,7 @@ Use test accounts, fictional business knowledge, and test phone numbers in a pub
 
 ## Product walkthrough
 
-These screenshots use fictional demo data. Account names, contact details, and unrelated message history are intentionally blurred. The comment-engagement example is an illustrative view of the existing promotion-linked behavior.
+These screenshots use fictional demo data. Account names, contact details, and unrelated message history are intentionally blurred.
 
 ### Knowledge-powered Instagram replies
 
@@ -188,21 +188,6 @@ These screenshots use fictional demo data. Account names, contact details, and u
   <tr>
     <td><a href="docs/demo/knowledge-03.png"><img src="docs/demo/knowledge-03.png" alt="Instagram DM showing a grounded answer based on the saved workout routine" width="100%"></a></td>
     <td><a href="docs/demo/knowledge-04.png"><img src="docs/demo/knowledge-04.png" alt="Instagram DM showing a conversational follow-up about personal training" width="100%"></a></td>
-  </tr>
-</table>
-
-### Comment engagement
-
-The keyword-based promotion workflow can recognize a relevant comment, publish a configured reply, and continue the conversation privately. The following pair is an illustrative example using fictional accounts.
-
-<table>
-  <tr>
-    <td width="50%"><strong>1. Recognize a relevant question.</strong><br>A follower includes the configured <code>FIT</code> keyword while asking about the trial.</td>
-    <td width="50%"><strong>2. Respond and move details to DM.</strong><br>The business publishes its configured public response and lets the private workflow handle the next step.</td>
-  </tr>
-  <tr>
-    <td><a href="docs/demo/comment-engagement-01.png"><img src="docs/demo/comment-engagement-01.png" alt="Illustrative fitness post with a follower asking whether the FIT trial is beginner-friendly" width="100%"></a></td>
-    <td><a href="docs/demo/comment-engagement-02.png"><img src="docs/demo/comment-engagement-02.png" alt="Illustrative fitness post with a public business reply confirming that trial details were sent by DM" width="100%"></a></td>
   </tr>
 </table>
 
