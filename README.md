@@ -167,6 +167,18 @@ supabase db reset
 supabase test db
 ```
 
+CI also runs Gitleaks against the full fetched Git history. To repeat the scan
+locally with Gitleaks 8.30.1 installed:
+
+```bash
+git fetch --all --tags
+gitleaks git --log-opts="--all --full-history -m" --redact .
+```
+
+Use a full clone (run `git fetch --unshallow` first if your clone is shallow).
+The single entry in `.gitleaksignore` documents a historical false positive
+where an empty secret setting caused the following numeric delay setting to match.
+
 ## Render deployment
 
 For a free portfolio-video deployment, `render.yaml` defines:

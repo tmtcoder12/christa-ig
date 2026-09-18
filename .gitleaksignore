@@ -1,0 +1,3 @@
+# False positive: an empty FOLLOWUP_CRON_SECRET caused the generic rule to
+# capture the next line, FOLLOWUP_DELAY_MINUTES=10 (a delay, not a credential).
+17fe5ba641daa4aeee63ac8f7bc131c95dce3401:backend/.env.example:generic-api-key:23
